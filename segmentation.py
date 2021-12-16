@@ -128,6 +128,31 @@ class Segmentor:
         logging.info("Combined sentences")
         # logging.info(str([0 if i in js else -1 for i in range(len(self.doc.spans["sents"]))]))
 
+
+    def second_pass(self, threshold=0.3, path='/cs/snapless/oabend/eitan.wagner/segmentation/models/xlnet-large-cased'):
+        """
+        Perform a second gpt2 pass after the dynamic and topic sampling, for places where the correlation between the topics is high
+        :return:
+        """
+        def best_break(gs, start, end):
+            sent0 = [s.start for s in self.sents].index(start)
+            sent1 = [s.end for s in self.sents].index(end)
+            return gs.segment_sents(self.doc, self.sents[sent0:sent1+1], num_segments=2)
+
+        from evaluation import Gpt2Segmentor
+        gs = Gpt2Segmentor()
+
+        cor_matrix = np.load(path + "/correlation_matrix.npy")
+        for i, s in enumerate(self.segment_spans[:-1]):
+            if cor_matrix[self.doc._.topics[i], self.doc._.topics[i+1]] > threshold:
+                start, end = self.doc.spans["segments"][i].start, self.doc.spans["segments"][i+1].end
+                bb = best_break(gs, start, end)
+                self.segment_spans[i] = bb[0]
+                self.segment_spans[i+1] = bb[1]
+                self.doc.spans["segments"] = self.segment_spans
+        return
+
+
     def from_list(self, l):
         """
         Add a segmentation from a list. This can be done after combining sents
@@ -213,7 +238,7 @@ class Segmentor:
 
         logging.info(f"len: {len(self.sents)}")
         for i in range(1, len(self.sents)+1):
-            if i % 100 == 0 or len(self.sents) - i < 100:
+            if i % 100 == 0 or len(self.sents) - i < 2:
                 logging.info(f"i: {i}")
                 self.model.save_cache()
 
@@ -563,16 +588,61 @@ if __name__ == '__main__':
     if len(sys.argv) > 4:
         method = sys.argv[4]
 
-    with_test = False
-    if method != 'lda':
+    suffix1 = str(gpt2_ratio) + method
+
+    logging.info("\n\n**************************\n")
+    smoothing_factor = 1
+    no_mc = False
+    use_saved = False
+    use_close = False
+    second_pass = False
+    with_test = False  # when this is True then we check only the eval set
+    if method[-5:-3] == 'sp':
+        threshold = float(method[-3:])
+        method = method[:-6]
+        second_pass = True
+        logging.info(f"Threshold: {threshold}")
+    if method[-2:] == 'sp':
+        method = method[:-3]
+        second_pass = True
+        threshold = 0.
+        logging.info(f"Threshold: {threshold}")
+    # if method[-1:] == 'c':
+    #     method = method[:-2]
+    #     use_close = True
+    if method[-1:] == 's':
+        method = method[:-2]
+        use_saved = True
+    # no_mc = False
+    if method[-4:] == 'nomc':
+        method = method[:-5]
+        no_mc = True
+    if method[-3:] == 's.5':
+        method = method[:-4]
+        smoothing_factor = 0.5
+    if method[-1:] == '1':
+        method = method[:-2]
+        np.random.seed(1)
+    else:
+        np.random.seed(0)  # gave set 102, 107, 109, 110, 115
+    if method[-4:] == 'test':
+        method = method[:-5]
+        with_test = True
+
+    logging.info(f"Using saved: {use_saved}")
+    logging.info(f"Using closeness: {use_close}")
+    logging.info(f"Using second_pass: {second_pass}")
+    # if method != 'lda':
+    if True:
         logging.info("Using a test set")
+        logging.info(f"with_test: {with_test}")
         # with_test = True
-        np.random.seed(0)
+
         evals = split_eval_test(r=range(101, 116), n=5)
 
 
     # scale = 150
-    scale = 100
+    scale = 200
     nt_scale = 20
     # all_mean, nt_mean = 262.2, 67.3
     # all_mean, nt_mean = 366, 67.3
@@ -596,11 +666,11 @@ if __name__ == '__main__':
     logging.info(f"GPT2 window: {gpt2_window}")
     logging.info(f"GPT2 ratio: {gpt2_ratio}")
     batch = False
-    if method != 'lda':
-        logging.info(f"Batch: {batch}")
-        logging.info(f"mean: {all_mean}")
-        logging.info(f"scale: {scale}")
-        logging.info(f"nt_mean: {nt_mean is not None}")
+    # if method != 'lda':
+    #     logging.info(f"Batch: {batch}")
+    #     logging.info(f"mean: {all_mean}")
+    #     logging.info(f"scale: {scale}")
+    #     logging.info(f"nt_mean: {nt_mean is not None}")
     # sys.stdout.flush()
 
     # model_id = sys.argv[3][:3]
@@ -611,7 +681,7 @@ if __name__ == '__main__':
     base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
     # model = SVMTextcat(base_path=base_path).from_path()
     # model = TransformerClassifier(base_path=base_path, model_name='distilbert-textcat')
-    if method == "graph":
+    if method == "graph" or no_mc:
         # mc = MC(base_path=base_path, name="models/transitions/mc.json")
         mc = None
         logging.info(f"Markov chain: {mc is not None}")
@@ -624,21 +694,34 @@ if __name__ == '__main__':
 
 
     scales = [scale]
-    if not with_test:
-        # scales = [100, 150, 200, 250, 300, 350, 400]
+    if gpt2_ratio == "0.75":
+        scales = [200]
+    elif gpt2_ratio == "0.0":  # ratio=0.0
+        scales = [100, 125, 150]
+    if not with_test:  # using test set
         if gpt2_ratio == "0.75":
+            # scales = [150, 175, 200, 225, 250]
+            scales = [200, 225]
+        if gpt2_ratio == "0.8":
             scales = [200]
+        if gpt2_ratio == "0.5":
+            scales = [150, 175, 200]
         elif gpt2_ratio == "0.0":  # ratio=0.0
-            scales = [125]
+            scales = [100, 125, 150]
 
     for scale in scales:
-        logging.info(f"Scale: {scale}")
+        suffix = f"s{scale}_" + suffix1
+        logging.info(f"\n\nScale: {scale}")
 
         # nums = get_sf_testimony_nums()
         nums = get_testimony_nums()
         # r = range(112, 115)
         # r = nums[10:12]
-        r = range(101, 116)
+        r = range(101, 121)
+        if not with_test:
+            r = [t for t in r if t not in evals]
+        # r = range(111, 116)
+        # evals = []
         if method == "graph":
             # r = range(104, 105)
             r = range(106, 107)
@@ -663,7 +746,7 @@ if __name__ == '__main__':
         # model.find_priors(mean=256.29, scale=scale)  # the mean for spacy token count with /200
         # logging.info(f"calculated priors. Scale: {scale}")
         if method != 'lda':
-            model.find_priors(mean=all_mean, scale=scale, nt_mean=nt_mean, nt_scale=nt_scale, r=r)
+            model.find_priors(mean=all_mean, scale=scale, nt_mean=nt_mean, nt_scale=nt_scale, r=r, smoothing_factor=smoothing_factor)
             # logging.info(f"calculated priors with separate for no topic. Scales: {scale}, {nt_scale}")
             logging.info(f"calculated priors with separate for no topic - {nt_mean is not None}")
         # summary_ratio=.15
@@ -690,9 +773,9 @@ if __name__ == '__main__':
         if method == "precomputed":
             r = [101, 103, 104, 105]
         for i in r:
-            if not with_test:
-                if i in evals:
-                    continue
+            # if not with_test:
+            #     if i in evals:
+            #         continue
 
             if method == "precomputed":
                 if i == 101:
@@ -709,48 +792,57 @@ if __name__ == '__main__':
             logging.info(f'\n\n\nTestimony {i}:')
             # d = Segmentor(i=i, text=get_testimony_text(i)[:], model=model, method='max')
 
-            data_path = '/cs/snapless/oabend/eitan.wagner/segmentation/data/'  # !!!!
-            doc = Doc(Vocab()).from_disk(data_path + 'gold_docs/doc_' + str(i))
-            gold_doc = Doc(Vocab()).from_disk(data_path + 'gold_docs/doc_' + str(i))
-            d = Segmentor(i=i, text=get_gold_text(i)[:], model=model, method=method, spacy_doc=doc)
-            # d = Segmentor(text=get_sf_testimony_text(i)[:], model=model)
-            if float(gpt2_window) > 0:
-                d.combine_sents(window=int(gpt2_window), ratio=float(gpt2_ratio))
+            data_path = '/cs/snapless/oabend/eitan.wagner/segmentation/data/'
+            if use_saved:
+                doc = Doc(Vocab()).from_disk(base_path + "out_docs_" + method + "/doc_" + str(i) + "_" + str(gpt2_ratio))
+                gold_doc = Doc(Vocab()).from_disk(data_path + 'gold_docs/doc_' + str(i))
+            else:
+                doc = Doc(Vocab()).from_disk(data_path + 'gold_docs/doc_' + str(i))
+                gold_doc = Doc(Vocab()).from_disk(data_path + 'gold_docs/doc_' + str(i))
+                d = Segmentor(i=i, text=get_gold_text(i)[:], model=model, method=method, spacy_doc=doc, summarizer=False)
+                # d = Segmentor(text=get_sf_testimony_text(i)[:], model=model)
+                if float(gpt2_window) > 0:
+                    d.combine_sents(window=int(gpt2_window), ratio=float(gpt2_ratio))
 
-            logging.info("\nFinding segments: ")
-            if method == "max":
-                c = d.find_segments()
-                logging.info("\nSampling topics: ")
-                assignments = d.sample_topics(num=1, allow_doubles=False)  # this might be an empty list!
-                num_segs.append(len(c[0]))
-            if method == 'lda':
-                c = d.find_segments(with_topics=False)
-                num_segs.append(len(c))
+                logging.info("\nFinding segments: ")
+                if method == "max":
+                    c = d.find_segments()
+                    logging.info("\nSampling topics: ")
+                    assignments = d.sample_topics(num=1, allow_doubles=False)  # this might be an empty list!
+                    if second_pass:
+                        d.second_pass(threshold=threshold)
+                    num_segs.append(len(c[0]))
+                if method == 'lda':
+                    c = d.find_segments(with_topics=False)
+                    num_segs.append(len(c))
 
-            if method == "precomputed":
-                c = d.from_list(l)
-                logging.info("\nSampling topics: ")
-                assignments = d.sample_topics(num=2, allow_doubles=False)  # this might be an empty list!
+                if method == "precomputed":
+                    c = d.from_list(l)
+                    logging.info("\nSampling topics: ")
+                    assignments = d.sample_topics(num=2, allow_doubles=False)  # this might be an empty list!
 
-            if method == "graph":
-                logging.info("\nMaking Probabilities: ")
-                if not find_min:
-                    d.make_probs(window=15, from_file=False, name=f'/cs/snapless/oabend/eitan.wagner/segmentation/probs{i}_{15}_{gpt2_ratio}')
-                else:
-                    probs = d.make_probs(window=15, from_file=True, name=f'/cs/snapless/oabend/eitan.wagner/segmentation/probs{i}_{15}_{gpt2_ratio}')
-                    logging.info("\nFinding best: ")
-                    c = d.find_segments_k(k=len(gold_doc.spans["segments"]), probs=probs)
+                if method == "graph":
+                    logging.info("\nMaking Probabilities: ")
+                    if not find_min:
+                        d.make_probs(window=15, from_file=False, name=f'/cs/snapless/oabend/eitan.wagner/segmentation/probs{i}_{15}_{gpt2_ratio}')
+                    else:
+                        probs = d.make_probs(window=15, from_file=True, name=f'/cs/snapless/oabend/eitan.wagner/segmentation/probs{i}_{15}_{gpt2_ratio}')
+                        logging.info("\nFinding best: ")
+                        c = d.find_segments_k(k=len(gold_doc.spans["segments"]), probs=probs)
 
             if method == "max" or method == "precomputed" or method == 'lda' or find_min:
                 # logging.info(len(c))
                 # d.save_doc(path=base_path + f"out_docs_{method}_r{gpt2_ratio}_w{gpt2_window}/")
-                if not find_min:
+                if not find_min and not use_saved:
                     logging.info(f"\nSaving doc {i}")
                     d.save_doc(path=base_path + f"out_docs_{method}/")
 
                 if method != 'lda' and not with_test:
                     for m in ["gestalt", "edit"]:
-                        topic_eval = evaluate_topics(doc=d.doc, gold_doc=gold_doc, method=m)
+                        if use_saved:
+                            topic_eval = evaluate_topics(doc=doc, gold_doc=gold_doc, method=m)
+                        else:
+                            topic_eval = evaluate_topics(doc=d.doc, gold_doc=gold_doc, method=m)
                         for j, t_m in enumerate(topic_methods):
                             topic_scores[m][t_m].append(topic_eval[j])
                         # edit_scores.append(topic_eval[0])
@@ -785,13 +877,14 @@ if __name__ == '__main__':
         # df.to_csv('/cs/snapless/oabend/eitan.wagner/segmentation/scripts/for_eval1.csv')
         logging.info(f"avg_segments: {np.mean(num_segs)}")
 
-        if (method == "max" or method == "precomputed" or method == 'lda' or find_min) and not with_test:
+        if method == "max" or method == "precomputed" or method == 'lda' or find_min:
             logging.info(f"Method: {method}, Ratio: {gpt2_ratio}, mean scale: {mean_scale}")
 
-            if method != 'lda':
+            if method != 'lda' and not with_test and not use_saved:
                 for m in ["gestalt", "edit"]:
                     logging.info(f"Topic score method - {m}")
                     for t_m in topic_methods:
+                        logging.info(suffix)
                         logging.info(f"Topic scores - {t_m}: {topic_scores[m][t_m]}")
                         logging.info(f"Avg: {np.mean(topic_scores[m][t_m])}")
                         # logging.info(f"Topic edit scores - dynamic: {edit_scores}")
@@ -802,7 +895,10 @@ if __name__ == '__main__':
                         # logging.info(f"Avg: {np.mean(edit_scores_uni)}")
 
             from evaluation import with_segeval
-            with_segeval(ratio=gpt2_ratio, r=r, method=method)
+            if use_saved:
+                with_segeval(ratio=gpt2_ratio, r=r, method=method, avg=350, use_close=use_close, suffix=suffix)
+            else:
+                with_segeval(ratio=gpt2_ratio, r=r, method=method, avg=d.model.prior_length, use_close=use_close, suffix=suffix)
             # for m in methods:
             #     logging.info(m + " accuracy scores and average: ")
             #     logging.info(accu_scores[m])
