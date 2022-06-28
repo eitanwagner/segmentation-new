@@ -34,7 +34,7 @@ class Segmentor:
     """
     Class for segmentation and topic assignment model
     """
-    def __init__(self, i, text=None, spacy_doc=None, model=None, method='marginal', summarizer=True):
+    def __init__(self, i, text=None, spacy_doc=None, model=None, method='marginal', summarizer=True, window_lm=False):
         """
 
         :param i: testimony number
@@ -55,6 +55,7 @@ class Segmentor:
         self.ps = None  # list of probabilities for the segments
         self.topic_assignments = []  # list of sampled assignments
         self.method = method
+        self.window_lm = window_lm
 
         self.gpt2scorer = GPT2Scorer()
         # self.gpt2scorer.load_cache(i)
@@ -65,7 +66,7 @@ class Segmentor:
         else:
             self.cats = None
         self.model = model
-        self.model.load_cache(i)
+        # self.model.load_cache(i)
 
         self.nlp = spacy.load("en_core_web_trf")
 
@@ -129,7 +130,7 @@ class Segmentor:
         # logging.info(str([0 if i in js else -1 for i in range(len(self.doc.spans["sents"]))]))
 
 
-    def second_pass(self, threshold=0.3, path='/cs/snapless/oabend/eitan.wagner/segmentation/models/xlnet-large-cased'):
+    def second_pass(self, threshold=0.3, path='/cs/snapless/oabend/eitan.wagner/segmentation/models/deberta-large'):
         """
         Perform a second gpt2 pass after the dynamic and topic sampling, for places where the correlation between the topics is high
         :return:
@@ -195,14 +196,18 @@ class Segmentor:
             for "graph" - list of probabilities of len num_topics
         """
         # create span
+
         span = self.doc[self.sents[start].start:self.sents[end-1].end]  # we don't want the end sentence too
+        spans = None
+        if self.window_lm:
+            spans = self.sents[start:end]  # in this case it's spans and not a span
         # get features - not used!
         if self.parser is not None:
             span._.feature_vector = self.parser.make_new_features(span, bin=int(5 * (start + end) / len(self.sents)))  # the bin is by the middle
         # get probability by model
         if self.method == 'max':
             # try:
-                return self.model.predict_max(span, prev_topic=prev_topic)
+                return self.model.predict_max(span, prev_topic=prev_topic, spans=spans)
             # except RuntimeError:  # too much memory used
             #     logging.info(f"Sequence too long. start: {start}, end: {end}, len: {len(span)}")
             #     return -np.inf, [], 0
@@ -484,13 +489,16 @@ class Segmentor:
                            "summaries": summaries})
         return df
 
-    def save_doc(self, path="/cs/snapless/oabend/eitan.wagner/segmentation/out_docs"):
+    def save_doc(self, path="/cs/snapless/oabend/eitan.wagner/segmentation/out_docs", bin=False):
         # remove_extensions()
         # self.doc.spans.pop("clusters", None)
         # self.doc.spans.pop("srls", None)
         # self.doc.spans.pop("segments", None)
         # self.doc._.trf_data = None
-        self.doc.to_disk(path + "doc_" + str(self.i) + "_" + str(self.gpt2ratio))
+        if bin:
+            self.doc.to_disk(path + "doc_" + str(self.i) + "_" + str(self.gpt2ratio) + "_b")
+        else:
+            self.doc.to_disk(path + "doc_" + str(self.i) + "_" + str(self.gpt2ratio))
 
     def segmentation_ll(self, doc):
         # computes the log likelihood for a given doc with segmentation (in doc.spans["segments"]
@@ -592,11 +600,18 @@ if __name__ == '__main__':
 
     logging.info("\n\n**************************\n")
     smoothing_factor = 1
+    # with_bin = False
+    with_bin = True
+    use_gpt2 = False
+    logging.info(f"With bin: {with_bin}")
     no_mc = False
     use_saved = False
     use_close = False
     second_pass = False
     with_test = False  # when this is True then we check only the eval set
+    if method[-3:] == 'flm':
+        use_gpt2 = True
+        method = method[:-4]
     if method[-5:-3] == 'sp':
         threshold = float(method[-3:])
         method = method[:-6]
@@ -633,22 +648,37 @@ if __name__ == '__main__':
     logging.info(f"Using closeness: {use_close}")
     logging.info(f"Using second_pass: {second_pass}")
     # if method != 'lda':
+    # r = ["sf_43019", "sf_38929", "sf_32788", "sf_38936", "sf_20505", "sf_23579", "sf_48155", "sf_35869", "sf_30751", "sf_30753",
+    #      "sf_25639", "sf_45091", "sf_32809", "sf_34857"]
+    r = ["sf_43019", "sf_38929", "sf_32788", "sf_38936", "sf_20505", "sf_23579", "sf_48155", "sf_35869", "sf_30751", "sf_30753",
+         "sf_45091", "sf_25639", "sf_46120", "sf_32809", "sf_34857", "sf_46122", "sf_30765", "sf_24622", "sf_21550", "sf_26672"]
+
+    # in "sf_46120", "sf_46122", "sf_30765", "sf_24622", "sf_21550", "sf_26672"
+    r = [_r+"_Y" for _r in r]
     if True:
         logging.info("Using a test set")
         logging.info(f"with_test: {with_test}")
         # with_test = True
 
-        evals = split_eval_test(r=range(101, 116), n=5)
+        # evals = split_eval_test(r=r, n=5)
+        # evals = split_eval_test(r=range(101, 116), n=5)
+        # logging.info(evals)
+        # evals = ["sf_43019", "sf_38929", "sf_32788", "sf_38936"]
+        # evals = [_e+"_Y" for _e in evals]
+        evals = r[:10]
 
 
     # scale = 150
+    # TODO these need to be updated with the new data
     scale = 200
     nt_scale = 20
+
     # all_mean, nt_mean = 262.2, 67.3
     # all_mean, nt_mean = 366, 67.3
-    all_mean, nt_mean = 350, None
+    # all_mean, nt_mean = 350, None
+    all_mean, nt_mean = 430, None
     mean_scale = 1
-    use_gpt2 = False
+
     find_min = False
     if len(sys.argv) > 5:
         find_min = True
@@ -687,37 +717,41 @@ if __name__ == '__main__':
         logging.info(f"Markov chain: {mc is not None}")
     else:
         # with open(base_path + 'models/transitions/mcc5_iner5.pkl', 'rb') as infile:
-        with open(base_path + 'models/transitions/mcc5_iner5_iter15.pkl', 'rb') as infile:
+        with open(base_path + 'models/transitions/mcc5_iner1_iter15_data5.pkl', 'rb') as infile:
+            # with open(base_path + 'models/transitions/mcc5_iner5_iter15.pkl', 'rb') as infile:
             mc = joblib.load(infile)
         # mc = MCClusters(k=5).load()
         logging.info(f"Markov chain ******** 5 clusters **********: {mc is not None}")
+        # logging.info(f"Markov chain ******** 10 clusters **********: {mc is not None}")
 
 
     scales = [scale]
     if gpt2_ratio == "0.75":
         scales = [200]
     elif gpt2_ratio == "0.0":  # ratio=0.0
-        scales = [100, 125, 150]
-    if not with_test:  # using test set
+        scales = [150]
+    if not with_test and not with_bin:  # using test set
         if gpt2_ratio == "0.75":
             # scales = [150, 175, 200, 225, 250]
-            scales = [200, 225]
+            scales = [1500, 1000, 550, 450, 350, 250]
         if gpt2_ratio == "0.8":
             scales = [200]
         if gpt2_ratio == "0.5":
             scales = [150, 175, 200]
         elif gpt2_ratio == "0.0":  # ratio=0.0
             scales = [100, 125, 150]
+    if with_bin:
+        logging.info("scale not used")
 
     for scale in scales:
         suffix = f"s{scale}_" + suffix1
         logging.info(f"\n\nScale: {scale}")
 
-        # nums = get_sf_testimony_nums()
-        nums = get_testimony_nums()
+        nums = get_sf_testimony_nums()
+        # nums = get_testimony_nums()
         # r = range(112, 115)
         # r = nums[10:12]
-        r = range(101, 121)
+        # r = range(101, 121)
         if not with_test:
             r = [t for t in r if t not in evals]
         # r = range(111, 116)
@@ -740,7 +774,7 @@ if __name__ == '__main__':
             model = TransformerClassifier(base_path=base_path, model_name=model_id, mc=mc, full_lm_scores=True)
         else:
             logging.info("No full LM scores")
-            model = TransformerClassifier(base_path=base_path, model_name=model_id, mc=mc, full_lm_scores=False)
+            model = TransformerClassifier(base_path=base_path, model_name=model_id, mc=mc, full_lm_scores=False, use_bins=with_bin)
 
         # scale = 20
         # model.find_priors(mean=256.29, scale=scale)  # the mean for spacy token count with /200
@@ -763,7 +797,7 @@ if __name__ == '__main__':
         accu_scores = {m: [] for m in methods}
         wd_scores = {m: [] for m in methods}
 
-        topic_scores = {"gestalt": {m: [] for m in topic_methods}, "edit": {m: [] for m in topic_methods}}
+        topic_scores = {"gestalt": {m: [] for m in topic_methods}, "edit": {m: [] for m in topic_methods}, "num_segments": []}
         # gest_scores = {m: [] for m in topic_methods}
         # edit_scores = {m: [] for m in topic_methods}
         # edit_scores = []
@@ -799,7 +833,7 @@ if __name__ == '__main__':
             else:
                 doc = Doc(Vocab()).from_disk(data_path + 'gold_docs/doc_' + str(i))
                 gold_doc = Doc(Vocab()).from_disk(data_path + 'gold_docs/doc_' + str(i))
-                d = Segmentor(i=i, text=get_gold_text(i)[:], model=model, method=method, spacy_doc=doc, summarizer=False)
+                d = Segmentor(i=i, text=get_gold_text(i)[:], model=model, method=method, spacy_doc=doc, summarizer=False, window_lm=use_gpt2)
                 # d = Segmentor(text=get_sf_testimony_text(i)[:], model=model)
                 if float(gpt2_window) > 0:
                     d.combine_sents(window=int(gpt2_window), ratio=float(gpt2_ratio))
@@ -810,7 +844,7 @@ if __name__ == '__main__':
                     logging.info("\nSampling topics: ")
                     assignments = d.sample_topics(num=1, allow_doubles=False)  # this might be an empty list!
                     if second_pass:
-                        d.second_pass(threshold=threshold)
+                        d.second_pass(threshold=threshold, path=base_path + f"models/{model_id}")
                     num_segs.append(len(c[0]))
                 if method == 'lda':
                     c = d.find_segments(with_topics=False)
@@ -835,9 +869,10 @@ if __name__ == '__main__':
                 # d.save_doc(path=base_path + f"out_docs_{method}_r{gpt2_ratio}_w{gpt2_window}/")
                 if not find_min and not use_saved:
                     logging.info(f"\nSaving doc {i}")
-                    d.save_doc(path=base_path + f"out_docs_{method}/")
+                    d.save_doc(path=base_path + f"out_docs_{method}/", bin=with_bin)
 
                 if method != 'lda' and not with_test:
+                    topic_scores["num_segments"].append(len(gold_doc.spans["segments"]))
                     for m in ["gestalt", "edit"]:
                         if use_saved:
                             topic_eval = evaluate_topics(doc=doc, gold_doc=gold_doc, method=m)
@@ -878,15 +913,20 @@ if __name__ == '__main__':
         logging.info(f"avg_segments: {np.mean(num_segs)}")
 
         if method == "max" or method == "precomputed" or method == 'lda' or find_min:
-            logging.info(f"Method: {method}, Ratio: {gpt2_ratio}, mean scale: {mean_scale}")
+            logging.info(f"\nMethod: {method}, Ratio: {gpt2_ratio}, mean scale: {mean_scale}")
 
             if method != 'lda' and not with_test and not use_saved:
+                logging.info("Num segments:")
+                logging.info(topic_scores["num_segments"])
                 for m in ["gestalt", "edit"]:
                     logging.info(f"Topic score method - {m}")
                     for t_m in topic_methods:
                         logging.info(suffix)
                         logging.info(f"Topic scores - {t_m}: {topic_scores[m][t_m]}")
                         logging.info(f"Avg: {np.mean(topic_scores[m][t_m])}")
+                        if m == "edit":
+                            logging.info(f"Normalized Topic Scores - {t_m}: {np.array(topic_scores[m][t_m]) / np.array(topic_scores['num_segments'])}")
+                            logging.info(f"Avg - {np.mean(np.array(topic_scores[m][t_m]) / np.array(topic_scores['num_segments']))}")
                         # logging.info(f"Topic edit scores - dynamic: {edit_scores}")
                         # logging.info(f"Avg: {np.mean(edit_scores)}")
                         # logging.info(f"Topic edit scores - mc: {edit_scores_mc}")
@@ -896,9 +936,11 @@ if __name__ == '__main__':
 
             from evaluation import with_segeval
             if use_saved:
-                with_segeval(ratio=gpt2_ratio, r=r, method=method, avg=350, use_close=use_close, suffix=suffix)
+                with_segeval(ratio=gpt2_ratio, r=r, method=method, avg=350, use_close=use_close, suffix=suffix, bin=with_bin)
             else:
-                with_segeval(ratio=gpt2_ratio, r=r, method=method, avg=d.model.prior_length, use_close=use_close, suffix=suffix)
+                # with_segeval(ratio=gpt2_ratio, r=r, method=method, avg=d.model.prior_length, use_close=use_close, suffix=suffix)
+                with_segeval(ratio=gpt2_ratio, r=r, method=method, avg=d.model.prior_length, use_close=use_close,
+                             suffix=suffix, annotators=None, bin=with_bin)
             # for m in methods:
             #     logging.info(m + " accuracy scores and average: ")
             #     logging.info(accu_scores[m])

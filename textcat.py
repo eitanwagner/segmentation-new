@@ -1,4 +1,3 @@
-
 import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.special import logsumexp
@@ -93,7 +92,7 @@ class SVMTextcat:
         self.vectorizer = dataset.vectorizer
         # self.model = train_svm(dataset, random_state=42, out_path=self.base_path + "models/")  # !!!
         if self.extra_features != 'ents_srls_bin2':
-        # if True:
+            # if True:
             self.model = train_svm(dataset, random_state=42, out_path=None)  # !!!
         else:
             self.model = train_svm(dataset, random_state=42, out_path=self.base_path + 'models/')
@@ -335,7 +334,7 @@ def train_svm(dataset, random_state=42, out_path=None):
     # clf = svm.SVC(kernel='poly', probability=True, gamma='scale', class_weight='balanced')
     # clf = svm.SVC(kernel='rbf', probability=True, gamma='scale', class_weight='balanced', C=2)
     clf = svm.SVC(kernel='rbf', probability=True, gamma=1/(2*X_train.shape[1] * v), class_weight='balanced', C=4)
-    clf = svm.SVC(kernel='linear', probability=True, gamma='scale', class_weight='balanced')
+    # clf = svm.SVC(kernel='linear', probability=True, gamma='scale', class_weight='balanced')
     # Train the model using the training sets
     logging.info("Training SVM")
     # logging.info(f"X_shape {X_train.shape}")
@@ -483,3 +482,4 @@ if __name__ == "__main__":
     # # now you can save it to a file
     # # model = joblib.load('/cs/snapless/oabend/eitan.wagner/segmentation/models/svm.pkl')
     # test_model(model, dataset, random_state=42, out_path='/cs/snapless/oabend/eitan.wagner/segmentation/models/')
+

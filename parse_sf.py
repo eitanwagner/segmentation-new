@@ -4,9 +4,11 @@ import json
 # import pickle
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import ParseError
+from datetime import time, timedelta
 
 from segment_srl import Referencer, SRLer
 import segment_srl
+from utils import merge_locs
 
 import pandas as pd
 import numpy as np
@@ -127,15 +129,25 @@ def get_raw_text(data_path):
         json.dump(texts, outfile)
 
 
-def parse_from_xml(data_path):
+def _remove_noise(doc, text):
+    _s = doc.text.find(text)
+    _s, _e = _s, _s + len(text)
+    return " ".join([s.text for s in doc.spans["sents"] if _s <= s.start_char and s.end_char <= _e])
+
+
+def parse_from_xml(data_path, num_bins=20, remove_noise=False):
     """
     Obtain list of segments with a topic
     :param data_path:
     :return:
     """
-    with open(data_path + 'words2topics-new.json', 'r') as infile:
+    with open(data_path + 'words2topics-new5.json', 'r') as infile:
         words2topics = json.load(infile)  # dict from sf index term to a topic
 
+    if remove_noise:
+        with open(data_path + 'sf_raw_text.json', 'r') as infile:
+            raw_texts = json.load(infile)
+        nlp = spacy.load("en_core_web_sm")
     from datetime import time
 
     data = pd.read_csv(data_path + "Martha_transcripts/index segments for 1000 English Jewish survivor interviews.csv")
@@ -168,6 +180,11 @@ def parse_from_xml(data_path):
 
 
     for _, t in enumerate(testimonies):  # for each testimony number
+        if remove_noise:
+            raw_text = raw_texts[str(t)]
+            doc = nlp(raw_text)
+            doc.spans["sents"] = [s for s in doc.sents]
+
         t_data = data[data['IntCode'] == t]  # data for the specific testimony
         num_tapes = numtapes[t]
         segments[t] = []  # list of segments for this testimony
@@ -214,8 +231,10 @@ def parse_from_xml(data_path):
                                 terms = [words2topics.get(t, None) for t in terms.split('; ') if words2topics.get(t, None) is not None]  # recognized terms
 
                             # 10 bins for the location in the testimony
-                            bin = str((10 * len(segments[t])) // len(t_data))
-                            segments[t].append({'text': ' '.join(words), 'bin': bin, 'terms': terms})
+                            bin = str((num_bins * len(segments[t])) // len(t_data))
+                            text = ' '.join(words)
+                            text = _remove_noise(doc, text)
+                            segments[t].append({'text': text, 'bin': bin, 'terms': terms})
                             segments_i += 1
                             if e.text is not None:  # last segment is not empty but not full minute
                                 words = [e.text]
@@ -234,12 +253,156 @@ def parse_from_xml(data_path):
             segments.pop(t, None)
 
     print(all_testimonies - testimonies - bad_ts)
-    with open(data_path + 'sf_unused.json', 'w') as outfile:
+    with open(data_path + 'sf_unused6.json', 'w') as outfile:
         json.dump(list(all_testimonies - testimonies - bad_ts), outfile)
 
     # take only segment with one topic
     segments = {t: [dict for dict in list if len(dict['terms']) == 1] for t, list in segments.items()}
-    with open(data_path + 'sf_segments.json', 'w') as outfile:
+    with open(data_path + 'sf_segments6.json', 'w') as outfile:
+        json.dump(segments, outfile)
+
+# ************************
+
+# def to_timedelta(s):
+#     """
+#     Converts string to timedelta object
+#     :param s: In format "00:00:00:00"
+#     :return:
+#     """
+#     # the value in miliseconds is:
+#     # int(td.seconds *1000 +td.microseconds/10**3)
+#     _s = s.split(":")
+#     return timedelta(hours=int(_s[0]), minutes=int(_s[1]), seconds=int(_s[2]), milliseconds=int(_s[3]))
+
+
+def to_milli(s):
+    """
+    Convert string to milliseconds
+    :param s:
+    :return:
+    """
+    _s = s.split(":")
+    return int(_s[0]) * 60 * 60 * 1e3 + int(_s[1]) * 60 * 1e3 + int(_s[2]) * 1e3 + int(_s[3]) * 10
+
+
+# def merge_locs(l1, l2):
+#     """
+#     Find locations of l2 within l1. Both arrays are assumed to be sorted
+#     :param l1:
+#     :param l2:
+#     :return: list of locations of l2 in l1 (represented by the number of elements before)
+#     """
+#     locs = []
+#     i = j = 0
+#
+#     while i < len(l1) and j < len(l2):
+#         if l1[i] < l2[j]:
+#             i += 1
+#         else:
+#             locs.append(i)
+#             j += 1
+#
+#     # add elements at the end
+#     while j < len(l2):
+#         locs.append(i)
+#         j += 1
+#
+#     return locs
+
+
+def parse_from_xml_2(data_path):
+    """
+    Obtain list of segments with a topic
+    :param data_path:
+    :return:
+    """
+
+    data = pd.read_csv(data_path + "Martha_transcripts/index segments for 1000 English Jewish survivor interviews.csv", encoding = "utf-8")
+    testimonies = set(data['IntCode'])
+    all_testimonies = set(testimonies)
+
+    segments = {}
+    numtapes = {}
+    bad_t = 0
+    bad_ts = set()
+
+    MAX_TIME = 1e7
+
+    # clean testimony list
+    # save only tapes with non-round times
+    for t in list(testimonies):
+        t_data = data[data['IntCode'] == t]  # data for the specific testimony
+        num_tapes = max(t_data['InTapenumber'])
+
+        # if sum(t_data['InTapenumber']) == sum(t_data['OutTapenumber']):  # no segments across tapes
+        #     continue
+        # in_times = [(time.fromisoformat(tm+'0'), n) for tm, n in zip(t_data['InTimeCode'], t_data['InTapeNumber'])]
+        # out_times = [(time.fromisoformat(tm+'0'), n) for tm, n in zip(t_data['OutTimeCode'], t_data['OutTapeNumber'])]
+
+        # we will use 10e7 as the upper limit for tape lengths
+        in_times = [to_milli(tm) + MAX_TIME * (n-1) for tm, n in zip(t_data['InTimeCode'], t_data['InTapenumber'])]
+        # out_times = [to_milli(tm) + MAX_TIME * n for tm, n in zip(t_data['OutTimeCode'], t_data['OutTapeNumber'])]
+        # if sum(in_times) % 100000 == 0:  # round times
+        #     continue
+
+        segments[t] = []  # list of segments for this testimony
+        mytrees = []
+
+        # for each tape of this testimony open the xml tree
+        for i in range(1, num_tapes+1):
+            try:
+                mytrees.append(ET.parse(data_path + f'Martha_transcripts/{t}.{i}.xml'))
+            except (FileNotFoundError, ParseError) as err:
+                # except:
+                if str(err)[:9] != "[Errno 2]":  # some bad characters
+                    with open(data_path + f'Martha_transcripts/{t}.{i}.xml', 'r', encoding='utf-8') as f:
+                        s = f.read().replace("&", " and ")
+                    with open(data_path + f'Martha_transcripts/{t}.{i}.xml', 'w', encoding='utf-8') as f:
+                        f.write(s)
+                    print(err)
+                    print(t, i)
+                continue
+
+        # get words and times for the whole testimony (with MAX_TIME added for each tape)
+        words = []
+        times = []
+        for i, mytree in enumerate(mytrees):
+            # scan the xml
+            myroot = mytree.getroot()
+            for j, r in enumerate(myroot):
+                for k, e in enumerate(r):
+                    l = len([_e for _e in e])
+                    if l == 0:
+                        if e.text is not None:
+                            words.append(e.text)
+                            times.append(int(e.attrib['m']) + MAX_TIME * i)
+                    else:
+                        for _e in e:
+                            # if _e.text =="Bartered":
+                            #     print("")
+                            if _e.text is not None:
+                                words.append(_e.text)
+                                times.append(int(e.attrib['m']) + MAX_TIME * i)
+                            continue
+
+
+        locs = merge_locs(in_times, times)
+        word_lists = [[] for _ in range(len(in_times))]
+        for w, loc in zip(words, locs):
+            word_lists[loc-1].append(w)
+
+        terms = list(t_data['IndexedTermLabels'])
+        if len(terms) != len(word_lists):
+            logging.info(f"Bad testimony: {t}")
+            continue
+        terms = [t.split('; ') if not pd.isna(t) else [] for t in terms]
+            # if t is not None:
+
+        # segments[t] = [{'text': ' '.join(w_l), 'terms': ts.split('; ')} for w_l, ts in zip(word_lists, terms)]
+        segments[t] = [{'text': ' '.join(w_l), 'terms': ts} for w_l, ts in zip(word_lists, terms)]
+
+    # with open(data_path + 'sf_nonrounds.json', 'w', encoding = "utf-8") as outfile:
+    with open(data_path + 'sf_all.json', 'w', encoding="utf-8") as outfile:
         json.dump(segments, outfile)
 
 
@@ -247,8 +410,11 @@ def parse_from_xml(data_path):
 # add additional properties
 
 class TestimonyParser:
-    def __init__(self, nlp):
-        self.referencer, self.srler = Referencer(nlp), SRLer(nlp)
+    def __init__(self, nlp, referencer=False, srler=False):
+        if referencer:
+            self.referencer = Referencer(nlp)
+        if srler:
+            self.srler = SRLer(nlp)
         add_extensions()
         self.nlp = nlp
         logging.info("Made testimony parser")
@@ -409,11 +575,12 @@ class TestimonyParser:
 
     def spacy_parse(self, data_path=None):
         # make the data into spacy span with properties from the whole doc
-        with open(data_path + 'sf_segments.json', 'r') as infile:
+        with open(data_path + 'sf_segments3.json', 'r') as infile:
             data = json.load(infile)
 
-        with open(data_path + 'docs/doc_nums2.json', "r") as infile:
-            doc_nums = json.load(infile)
+        # with open(data_path + 'docs/doc_nums2.json', "r") as infile:
+        #     doc_nums = json.load(infile)
+        doc_nums = []
 
         new_data = {}
         # doc_bin = DocBin(store_user_data=True)
@@ -434,9 +601,13 @@ class TestimonyParser:
             #     pickle.dump(doc, outfile)
 
             # doc.to_disk(data_path + "docs/" + doc_names[-1])
-            with open(data_path + 'docs/doc_nums2.json', "w+") as outfile:
+            # with open(data_path + 'docs/doc_nums2.json', "w+") as outfile:
+            #     json.dump(doc_nums, outfile)
+            # with open(data_path + 'docs/data2_2.json', "w+") as outfile:  # did I overwrite the old data???
+            #     json.dump(new_data, outfile)
+            with open(data_path + 'docs/doc_nums3.json', "w+") as outfile:
                 json.dump(doc_nums, outfile)
-            with open(data_path + 'docs/data2_2.json', "w+") as outfile:  # did I overwrite the old data???
+            with open(data_path + 'docs/data3.json', "w+") as outfile:  # did I overwrite the old data???
                 json.dump(new_data, outfile)
 
             # doc_bin.add(doc)
@@ -445,7 +616,50 @@ class TestimonyParser:
 
         # docs = list(docs.values())
         # doc_bin = DocBin(docs=docs, store_user_data=True)
-        logging.info("Created data - data2_2")
+        logging.info("Created data - data3")
+        return
+
+    def simple_parse(self, data_path=None, remove_noise=False, with_bin=False):
+        # simple making of the data as list of (text, label)
+        with open(data_path + 'sf_segments6.json', 'r') as infile:
+            data = json.load(infile)
+
+        # with open(data_path + 'docs/doc_nums2.json', "r") as infile:
+        #     doc_nums = json.load(infile)
+        doc_nums = []
+
+        new_data = {}
+        # doc_bin = DocBin(store_user_data=True)
+        for t, dicts in data.items():
+            if t in doc_nums:
+                # doc_nums.remove(t)
+                continue
+            logging.info(f"Testimony: {t}")
+            # texts, labels = list(zip(*[(dict['text'], dict['terms']) for dict in dicts]))
+            if with_bin:
+                new_data[t] = [(dict['text'], dict['bin'], dict['terms']) for dict in dicts]
+            else:
+                new_data[t] = [(dict['text'], [], dict['terms']) for dict in dicts]
+
+            # doc = self.parse_from_segments(texts, labels=labels)  # we don't transform labels yet
+
+            # new_data[t] = self.get_lists(doc)
+            doc_nums.append(t)
+            # remove_extensions()
+            # with open(data_path + "docs/" + doc_names[-1]) as outfile:
+            #     pickle.dump(doc, outfile)
+
+            # doc.to_disk(data_path + "docs/" + doc_names[-1])
+            # with open(data_path + 'docs/doc_nums2.json', "w+") as outfile:
+            #     json.dump(doc_nums, outfile)
+            # with open(data_path + 'docs/data2_2.json', "w+") as outfile:  # did I overwrite the old data???
+            #     json.dump(new_data, outfile)
+            with open(data_path + 'docs/doc_nums6.json', "w+") as outfile:
+                json.dump(doc_nums, outfile)
+            with open(data_path + 'docs/data6.json', "w+") as outfile:  # did I overwrite the old data???
+                json.dump(new_data, outfile)
+
+        logging.info("Created data - data6")
         return
 
     def get_lists(self, doc):
@@ -457,6 +671,82 @@ class TestimonyParser:
             self.srler.add_to_Span(s, self.srler.parse(s.text))
 
 
+#********
+
+def print_topic_by_sent(base_path):
+    data_path = base_path + "data/"
+    import spacy
+    import joblib
+    nlp = spacy.load("en_core_web_trf")
+    from transformer_classification import TransformerClassifier
+    model = TransformerClassifier(base_path=base_path, model_name='xlnet-large-cased-new', mc=None, full_lm_scores=False)
+    encoder_path = base_path + '/models/xlnet-large-cased-new/'
+    encoder = joblib.load(encoder_path + "label_encoder.pkl")
+
+
+    with open(data_path + 'sf_unused3.json', 'r') as infile:
+        unused = json.load(infile)
+    with open(data_path + 'sf_raw_text.json', 'r') as infile:
+        texts = json.load(infile)
+
+    d = {}
+    num_topics = 3
+    for u in unused[:10]:
+        print(u)
+        text = texts[str(u)]
+        doc = nlp(text)
+        # sent_w_t = [(s.text, model.predict_max(s)[2]) for s in doc.sents]
+        # sents = [s for s in doc.sents]
+        spacy_sents = [s for s in doc.sents]
+        sents = []
+        # for i, s in enumerate(spacy_sents):
+        for i in range(0, len(spacy_sents), 5):
+            s = spacy_sents[i]
+            sents.append(doc[s.start:spacy_sents[min(i+4, len(spacy_sents)-1)].end].text)
+            # i += 4
+            # if i > len(spacy_sents):
+            #     break
+            # # s2 = next(doc.sents, s)
+            # s2 = next(doc.sents, None)
+            # # s3 = next(doc.sents, s2)
+            # s3 = next(doc.sents, None)
+            # if s3 is not None:
+            #     sents.append(doc[s.start:s3.end])
+            # elif s2 is not None:
+            #     sents.append(doc[s.start:s2.end])
+            # else:
+            #     sents.append(doc[s.start:s.end])
+            # print(doc[s.start:s3.end].text + "\n")
+            # try:
+            #     sents.append(" ".join([s.text, next(doc.sents).text, next(doc.sents).text]))
+            #     # sents.append(doc[s.start:next(doc.sents).end])
+            # except StopIteration:
+            #     try:
+            #         sents.append(" ".join([s.text, next(doc.sents).text]))
+            #         # sents.append(doc[s.start:next(doc.sents).end])
+            #     except StopIteration:
+            #         sents.append(s.text)
+
+            print(sents[-1] + "\n\n")
+
+        # topics = encoder.inverse_transform([model.predict_max(s)[2] for s in sents])
+        topics = np.array([np.argpartition(model.predict_raw(s), -num_topics)[-num_topics:] for s in sents])
+
+        # d[str(u) + "_text"] = [s.text for s in sents]
+        d[str(u) + "_text"] = [s for s in sents]
+        for i in range(num_topics):
+            d[f"{u}_topic_{i}"] = encoder.inverse_transform(topics[:, i])
+        # d[str(u) + "_topic"] = topics
+
+        # print(f"\n\nTestimony {u}:")
+        # print("Topic list (by sentences):")
+        # print(topics)
+
+    import pandas as pd
+    df = pd.DataFrame.from_dict(d, orient='index').T
+    df.to_csv(base_path + "topic_by_sent5_3.csv")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     import logging.config
@@ -464,15 +754,17 @@ if __name__ == "__main__":
 
     # nlp = spacy.load("en_core_web_trf")
     # add_extensions()
-    data_path = '/cs/snapless/oabend/eitan.wagner/segmentation/data/'
+    base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
+    data_path = base_path + 'data/'
 
+    # print_topic_by_sent(base_path)
     # get_raw_text(data_path)
-    # parse_from_xml(data_path)
-    make_unused(data_path)
+    parse_from_xml(data_path, remove_noise=True)
+    # make_unused(data_path)
 
-    MEAN, CR, SRL = False, False, False
-    # parser = TestimonyParser(nlp)
-    # parser.spacy_parse(data_path)
-    # count_topics()
+    # MEAN, CR, SRL = False, False, False
+    parser = TestimonyParser(nlp=None)
+    parser.simple_parse(data_path, with_bin=True)
+    # # count_topics()
 
 # different format - 19895, 20218, 20367, 20405, 20505, 20873, 20909 etc.

@@ -1,4 +1,3 @@
-
 import numpy as np
 from pomegranate import MarkovChain
 from pomegranate import DiscreteDistribution
@@ -10,6 +9,46 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import OneHotEncoder
 import logging
 from scipy.special import logsumexp
+
+
+class MultinomialMixture:
+    def __init__(self, classifier, vectorizer):
+        """
+        :param classifier: the classifier for obtaining the probability weights
+        """
+
+        self.ps = None  # a table of probabilities (as column vectors)
+        # self.priors = None  # prior probability for each vector
+        self.n = None  # dimension
+        self.classifier = classifier
+        self.vectorizer = vectorizer
+        self.weights = None
+
+    def from_dmm(self, dmm):
+        """
+        Obtain probabilities
+        :param dmm:
+        :return:
+        """
+        self.ps = dmm.psi
+
+    def set_weights(self, text):
+        """
+        Get the weights from the classifier, given a text
+        :return:
+        """
+        x = self.vectorizer.fit_transform([text]).astype(dtype=float).todense()
+        self.classifier.predict_proba(x)[0]  #
+
+    def prod_prob(self, weights=None):
+        """
+
+        :param weights:
+        :return:
+        """
+        if weights is None:
+            weights = self.weights
+        return self.psi @ np.array(weights)
 
 
 class MC:
@@ -24,10 +63,11 @@ class MC:
         else:
             self.mc = None
 
-        encoder_path = base_path + '/models/xlnet-large-cased/'
+        encoder_path = base_path + '/models/deberta-large/'
+        # encoder_path = base_path + '/models/xlnet-large-cased/'
         self.encoder = joblib.load(encoder_path + "label_encoder.pkl")  # this does not have a "begin" and "end" label
 
-    def fit(self, chains, out_name=None):
+    def fit(self, chains, out_name=None, inertia=0.5):
         """
         Fit from a list of chains
         :param chains: list of topic-lists
@@ -42,7 +82,7 @@ class MC:
         d2 = ConditionalProbabilityTable(t_list, [d1])
         self.mc = MarkovChain([d1, d2])
 
-        self.mc.fit(chains, inertia=0.5)
+        self.mc.fit(chains, inertia=inertia)
         # self.mc = MarkovChain.from_samples(chains)
         if out_name:
             with open(base_path + out_name, 'w+') as f:
@@ -89,6 +129,37 @@ class MC:
         return self.mc.sample(k)
 
 
+class LocationClassifier:
+    def __init__(self, base_path='/cs/snapless/oabend/eitan.wagner/segmentation/', bins=20):
+        # self.base_path = base_path
+        self.encoder_path = base_path + 'models/deberta-large2/'
+        self.encoder = joblib.load(self.encoder_path + "label_encoder.pkl")  # this does not have a "begin" and "end" label
+        self.bins = bins
+        self.probs = np.ones((bins, len(self.encoder.classes_)))  # each row will be a probability for this bin
+
+    def fit(self, chains, pseudo_counts=1):
+        def to_bin(i, j):
+            return int(self.bins * i / j)
+
+        self.probs = self.probs * pseudo_counts
+        # in_bin = np.zeros(self.bins)
+        for c in chains:
+            for i, _c in enumerate(c):
+                self.probs[to_bin(i, len(c)), _c] += 1
+
+        # normalize
+        self.probs = self.probs / np.sum(self.probs, axis=1, keepdims=True)
+        return self
+
+    def predict(self, loc, encoded=True):
+        # predict vector
+        # loc between 0 and 1 (not including 1!)
+        return self.probs[int(loc * self.bins), :]
+
+    def save_probs(self):
+        np.save(self.encoder_path + "bin_probs.npy", self.probs)
+
+
 def make_chains(base_path, save=False):
     """
     Makes topic-chains from the SF data
@@ -96,28 +167,131 @@ def make_chains(base_path, save=False):
     :param save: whether to save to file
     :return: list of topic-lists
     """
-    encoder_path = base_path + '/models/xlnet-large-cased/'
+    # encoder_path = base_path + '/models/xlnet-large-cased/'
+    encoder_path = base_path + '/models/deberta-large2/'
     encoder = joblib.load(encoder_path + "label_encoder.pkl")  # this does not have a "begin" and "end" label
 
     docs_path = base_path + '/data/docs/'
-    with open(docs_path + "data2.json", 'r') as infile:
+    with open(docs_path + "data6.json", 'r') as infile:
         data = json.load(infile)
 
-    topic_lists = [encoder.transform(np.ravel([_d[2] for _d in d])).tolist() for _, d in data.items()]
+    # topic_lists = [encoder.transform(np.ravel([_d[2] for _d in d])).tolist() for _, d in data.items()]
+    _topic_lists = [(t, encoder.transform(np.ravel([_d[2] for _d in d])).tolist()) for t, d in data.items()]
+    ts, topic_lists = list(zip(*_topic_lists))
     for l in topic_lists:
         for i in range(len(l)-1, 0, -1):
             if l[i] == l[i-1]:
                 l.pop(i)
+    dict = {t: l for t, l in zip(ts, topic_lists)}
 
     if save:
         print(topic_lists)
-        with open('/cs/snapless/oabend/eitan.wagner/segmentation/data/chains.json', "w+") as outfile:
-            json.dump(topic_lists, outfile)
+        with open('/cs/snapless/oabend/eitan.wagner/segmentation/data/chain6.json', "w+") as outfile:
+            json.dump(list(topic_lists), outfile)
+        with open('/cs/snapless/oabend/eitan.wagner/segmentation/data/chain_dict6.json', "w+") as outfile:
+            json.dump(dict, outfile)
+
+        # save the list of testimonies (for the classifier)
+        print(ts)
+        with open('/cs/snapless/oabend/eitan.wagner/segmentation/data/ts6.json', "w+") as outfile:
+            json.dump(list(ts), outfile)
         print(encoder.classes_)
-        with open('/cs/snapless/oabend/eitan.wagner/segmentation/data/topics.json', "w+") as outfile:
+        with open('/cs/snapless/oabend/eitan.wagner/segmentation/data/topics6.json', "w+") as outfile:
             json.dump(encoder.classes_.tolist(), outfile)
 
     return topic_lists
+
+def make_long_train(base_path):
+    encoder_path = base_path + '/models/deberta-large2/'
+    encoder = joblib.load(encoder_path + "label_encoder.pkl")  # this does not have a "begin" and "end" label
+
+    data_path = base_path + '/data/'
+    with open(data_path + "chain_dict6.json", 'r') as infile:
+        chain_data = json.load(infile)
+
+    with open(data_path + 'sf_raw_text.json', 'r') as infile:
+        texts = json.load(infile)
+
+    data = [(texts[t], " </s> ".join(encoder.inverse_transform(chain))) for t, chain in chain_data.items()]
+
+    with open('/cs/snapless/oabend/eitan.wagner/segmentation/data/long_train2.json', "w+") as outfile:
+        json.dump(data, outfile)
+    return data
+
+def get_sf_testimony_texts(l, data_path='/cs/snapless/oabend/eitan.wagner/segmentation/data/'):
+    """
+    Obatin a list of sentences for testimony i (in the SF corpus)
+    :param i:
+    :param data_path:
+    :return:
+    """
+    with open(data_path + 'sf_raw_text.json', 'r') as infile:
+        texts = json.load(infile)
+    return [texts[i] for i in l]
+
+def fit_dmm(chains, k):
+    from GPyM_TM import GSDMM
+    # corpus = [" ".join([str(_c) for _c in c]) for c in chains]
+    corpus = [[str(_c) for _c in c] for c in chains]
+    dmm = GSDMM.DMM(corpus=corpus, nTopics=k)
+    # dmm = GSDMM.DMM(corpus=chains, nTopics=k)
+    dmm.topicAssigmentInitialise()
+    dmm.inference()
+    dmm.worddist()
+    finalAssignments = dmm.writeTopicAssignments()
+    return dmm.topicAssignments
+
+
+def train_classifier(base_path, out_path=None, k=5, topic_assignments=None):
+    """
+    train a classifier from testimony to MC in the mixture model
+    :return:
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.model_selection import train_test_split
+    from sklearn.svm import SVC
+    from sklearn.tree import DecisionTreeClassifier
+    from scipy.sparse import csr_matrix
+    from sklearn.metrics import accuracy_score
+
+    # with open('/cs/snapless/oabend/eitan.wagner/segmentation/data/chains5.json', "r") as infile:
+    #     topic_lists = json.load(infile)
+    tfidf = TfidfVectorizer()
+    # encoder = LabelEncoder()
+
+    with open(base_path + '/data/ts5.json', "r") as infile:
+        ts = json.load(infile)
+
+    texts = get_sf_testimony_texts(ts)
+    if topic_assignments is None:
+        # load id2set from the MCC classifier
+        mcc = joblib.load(base_path + f'models/transitions/mcc{k}_iner1_iter15_data5.pkl')
+        y = mcc.id2set
+    else:
+        y = topic_assignments
+
+    X = tfidf.fit_transform(texts).astype(dtype=float)
+    # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=14)
+    X_train = csr_matrix(np.nan_to_num(X_train.todense()), dtype=float)
+    X_test = csr_matrix(np.nan_to_num(X_test.todense()), dtype=float)
+    # train
+    # clf = DecisionTreeClassifier(max_depth=5)
+    clf = SVC(probability=True)
+    # logging.info("Training SVM")
+    clf.fit(X_train, y_train)
+
+    #Predict the response for test dataset
+    # logging.info(X_train[:10])
+    logging.info(y_train[:10])
+    y_pred = clf.predict(X_train)
+    logging.info(f"Accuracy (train): {accuracy_score(y_train, y_pred)}")
+    y_pred = clf.predict(X_test)
+    logging.info(f"Accuracy (test): {accuracy_score(y_test, y_pred)}")
+    # save
+    if out_path is not None:
+        joblib.dump(clf, out_path + f'svm5_{k}.pkl')
+    return clf
 
 
 def get_topic_list(base_path):
@@ -140,7 +314,8 @@ class MCClusters:
     """
     Class for clustering as a mixture of Markov Chains
     """
-    def __init__(self, k=10):
+    def __init__(self, k=10, inertia=0.5):
+        self.inertia = inertia
         self.k = k
         self.mcs = [None] * k
         self.sets = [None] * k  # each set is a list of chain indices
@@ -149,11 +324,28 @@ class MCClusters:
         self.ll = None
 
         self.base_path='/cs/snapless/oabend/eitan.wagner/segmentation/'
-        encoder_path = self.base_path + '/models/xlnet-large-cased/'
+        # encoder_path = self.base_path + '/models/xlnet-large-cased/'
+        encoder_path = self.base_path + '/models/deberta-large/'
         self.encoder = joblib.load(encoder_path + "label_encoder.pkl")  # this does not have a "begin" and "end" label
+
+    def make_testimony2chain(self, testimony_list):
+        """
+        Makes a dict from testimony id to the best MC
+        :return:
+        """
+        return dict(zip(testimony_list, self.id2set))
 
     def _chain2topics(self, chain):
         return self.encoder.inverse_transform(chain)
+
+    def save_id2set(self, name=''):
+        """
+        Save sets of chains as a dict by testimony
+        :param name:
+        :return:
+        """
+        with open(f'/cs/snapless/oabend/eitan.wagner/segmentation/data/'+name, "w+") as outfile:
+            json.dump(self.id2set, outfile)
 
     def save_sets(self, name=''):
         """
@@ -208,7 +400,7 @@ class MCClusters:
         if idxs is not None:
             for i in idxs:
                 if len(sets[i]) >= 0:
-                    self.mcs[i] = MC().fit([self.chains[s] for s in sets[i]])
+                    self.mcs[i] = MC().fit([self.chains[s] for s in sets[i]], inertia=self.inertia)
             sets = [sets[i] for i in idxs]
             mcs = [self.mcs[i] for i in idxs]
             chains = [self.chains[j] for s in sets for j in s]
@@ -216,7 +408,7 @@ class MCClusters:
         else:
             for i in range(len(sets)):
                 if len(sets[i]) >= 0:
-                    self.mcs[i] = MC().fit([self.chains[s] for s in sets[i]])
+                    self.mcs[i] = MC().fit([self.chains[s] for s in sets[i]], inertia=self.inertia)
             mcs = self.mcs
             chains = self.chains
 
@@ -280,7 +472,7 @@ class MCClusters:
 
                     if ll2 > ll:
                         ll = ll2
-                    # if ll2sets2 > ll2sets:
+                        # if ll2sets2 > ll2sets:
                         ll = ll2
                         # print(f"ll: {ll}")
                         self.id2set[j] = s_i
@@ -329,36 +521,41 @@ class MCClusters:
         return np.average(vectors, axis=0, weights=weights)
         # return np.sum(weights[:, np.newaxis] * vectors, axis=0)
 
-
-
-if __name__ == '__main__':
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    import logging.config
-    logging.config.dictConfig({'version': 1, 'disable_existing_loggers': True, })
+def train_mcc():
     base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
 
-    # make_transition_matrix(base_path=base_path)
-    # # p = mc.predict(topic=4, prev_topic=5)
-    # # p2 = mc.predict(topic=14, prev_topic=35)
-    # # p3 = mc.predict(topic=14, prev_topic=14)
-    # p4 = mc.predict(topic=25, prev_topic=20)
-    # ps = mc.predict_vector(20)
-    # chains = make_chains(base_path, save=True)
-    t_l = get_topic_list(base_path)
-    print("done")
-    # mc = MC(name='').fit(chains, out_name="models/transitions/mc_iner1")
-
     # chains = [[1,2,3,4,5],[2,3,4,5,1],[4,3,4,3,2], [3,4,5,1,2], [5,4,3,2,1]]
-    # logging.info("Using max cluster")
+    logging.info("Using max cluster")
     # lls = []
+    train_mcc = True
+    train_dmm = False
+    inertias = [0.1]
+    # inertias = [0.1, 0.3, 0.5, 0.7, 0.9]
     # for k in [2, 3, 5, 7, 10, 15, 20]:
-    #     logging.info(f"k: {k}")
-    #     mcc = MCClusters(k=k).fit(chains)
-    #     lls.append(mcc.ll)
-    # logging.info(f"likelikhoods for {k}:")
-    # logging.info(lls)
-    #
+    # for k in [10]:
+    # for k in [3,4,7]:
+    for k in [5]:
+        # for k in [2]:
+        logging.info(f"k: {k}")
+        for iner in inertias:
+            if train_mcc:
+                logging.info(f"inertia: {iner}")
+                mcc = MCClusters(k=k, inertia=iner).fit(chains, iterations=15)
+                mcc.save_sets()
+                logging.info(f"likelikhood for {k} {iner}: {mcc.ll}")
+                # lls.append(mcc.ll)
+                # logging.info(f"likelikhoods for {k}:")
+                # logging.info(lls)
+                #         if k == 5 and iner == 0.1:
+                if True:
+                    joblib.dump(mcc, base_path + f'models/transitions/mcc{k}_iner{str(iner)[-1]}_iter15_data5.pkl')
+
+            # if not train_dmm:
+            #     train_classifier(base_path=base_path, out_path=base_path + 'models/transitions/', k=k)
+            # else:
+            #     ta = fit_dmm(chains=chains, k=k)
+            #     logging.info(ta[:10])
+            #     train_classifier(base_path=base_path, topic_assignments=ta)
     # logging.info("Using weighted probability")
     # # for k in [2, 3, 5, 7, 10, 15, 20]:
     # lls = []
@@ -372,3 +569,31 @@ if __name__ == '__main__':
     # joblib.dump(mcc, base_path + 'models/transitions/mcc5_iner5_iter15.pkl')
     # x=3
     # print(mcc)
+
+def train_bin():
+    base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
+    chains = make_chains(base_path, save=False)
+    l_c = LocationClassifier(base_path=base_path, bins=20).fit(chains=chains)
+    l_c.save_probs()
+
+if __name__ == '__main__':
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    import logging.config
+    logging.config.dictConfig({'version': 1, 'disable_existing_loggers': True, })
+    base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
+
+    # train_bin()
+    # make_transition_matrix(base_path=base_path)
+    # # p = mc.predict(topic=4, prev_topic=5)
+    # # p2 = mc.predict(topic=14, prev_topic=35)
+    # # p3 = mc.predict(topic=14, prev_topic=14)
+    # p4 = mc.predict(topic=25, prev_topic=20)
+    # ps = mc.predict_vector(20)
+
+    # chains = make_chains(base_path, save=True)
+    make_long_train(base_path)
+    # t_l = get_topic_list(base_path)
+    # print("done")
+    # mc = MC(name='').fit(chains, out_name="models/transitions/mc_iner1")
+

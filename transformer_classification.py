@@ -11,6 +11,8 @@ os.environ['HF_METRICS_CACHE'] = CACHE_DIR
 # os.environ["WANDB_DISABLED"] = "true"
 
 import torch
+print(torch.__version__)
+print(torch.version.cuda)
 from torch import nn
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -25,6 +27,8 @@ import logging
 from gpt2 import GPT2Scorer
 
 from transitions import MC, MCClusters
+import lengths
+from lengths import LengthEstimators
 
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -33,6 +37,7 @@ from transformers import RobertaTokenizer, RobertaForSequenceClassification
 from transformers import ElectraTokenizer, ElectraForSequenceClassification
 from transformers import XLNetTokenizer, XLNetForSequenceClassification
 from transformers import DistilBertTokenizer
+from transformers import DebertaV2Tokenizer, DebertaV2ForSequenceClassification
 
 if torch.cuda.is_available():
     dev = torch.device("cuda:0")
@@ -54,13 +59,15 @@ class TransformerClassifier:
     Predicts segment scores based on the classifier, Markov chain and length probabilities
     """
     def __init__(self, base_path='/cs/snapless/oabend/eitan.wagner/segmentation/', model_name='electra-large-textcat',
-                 mc=None, full_lm_scores=False):
+                 mc=None, full_lm_scores=False, use_bins=False):
         # does not use extra features
         self.mc = mc
         # self.marginal = np.log(list(self.mc.mc.distributions[1].marginal().parameters[0].values()))
         # logging.info(f"Topic marginal: {list(np.exp(self.marginal))}")
         self.model = AutoModelForSequenceClassification.from_pretrained(base_path + 'models/' + model_name,
                                                                         cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self.model.to(dev)
         self.model.eval()
         self.model_name = model_name
@@ -74,7 +81,8 @@ class TransformerClassifier:
         elif model_name == 'xlnet-base-textcat':
             self.tokenizer = AutoTokenizer.from_pretrained('xlnet-base-cased',
                                                            cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
-        elif model_name == 'xlnet-large-cased':
+        # elif model_name == 'xlnet-large-cased':
+        elif model_name[:11] == 'xlnet-large':
             self.tokenizer = AutoTokenizer.from_pretrained('xlnet-large-cased',
                                                            cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
         elif model_name == 'distilbert-textcat':
@@ -83,9 +91,21 @@ class TransformerClassifier:
         elif model_name == 'roberta-large':
             self.tokenizer = AutoTokenizer.from_pretrained('roberta-large',
                                                            cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+        elif model_name in ['deberta-large', 'deberta-large2']:
+            self.tokenizer = AutoTokenizer.from_pretrained('microsoft/deberta-v3-large',
+                                                           cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+        elif model_name == 'distilroberta':
+            self.tokenizer = AutoTokenizer.from_pretrained('distilroberta-base',
+                                                      cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+
+        self.probs = None
+        if use_bins:
+            self.probs = np.load(base_path + 'models/' + model_name + "/bin_probs.npy")
+            self.len_estimators = joblib.load(base_path + 'models/' + model_name + f'/length_estimator{10}.pkl')
+            self.segments_estimator = joblib.load(base_path + 'models/' + model_name + '/segments_estimator.pkl')
 
         if full_lm_scores:
-            self.lm_scorer = GPT2Scorer()
+            self.lm_scorer = GPT2Scorer(window=3)
         else:
             self.lm_scorer = None
         self.vocab_len = len(self.tokenizer.get_vocab())
@@ -97,7 +117,7 @@ class TransformerClassifier:
         self.nt_prior_length = None  # for NO_TOPIC
         self.nt_prior_scale = None
 
-        self.topics_prior =None
+        self.topics_prior = None
 
         self.cache = {}  # classifier cache
         self.cache_id = None
@@ -126,14 +146,19 @@ class TransformerClassifier:
         if self.lm_scorer is not None:
             self.lm_scorer.load_cache(i)
 
-    def _predict(self, span, prev_topic=None):
+    def _predict(self, span, prev_topic=None, spans=None):
         """
         Calculates the probabilities for the span
         :param span:
         :param prev_topic:
         :return: tuple of the total probability vector, and the classification probability vector
         """
-        text = span.text
+        if len(span) > 1500:
+            # TODO think about this
+            extra = len(span) - 1500
+            text = span[extra//2: -extra//2].text
+        else:
+            text = span.text
         if text in self.cache.keys():
             out = self.cache[text]
         else:
@@ -144,35 +169,72 @@ class TransformerClassifier:
                 out = self.model(encodings['input_ids']).logits.detach()[0].cpu().numpy()
                 self.cache[text] = out
             except RuntimeError:
-                logging.info(f"span len: {len(span)}")
-                logging.info(f"span start: {span.start}")
-                logging.info(f"prev topic: {prev_topic}")
+                # logging.info(f"span len: {len(span)}")
+                # logging.info(f"span start: {span.start}")
+                # logging.info(f"prev topic: {prev_topic}")
                 raise
         pred_logp = np.ravel(log_softmax(out))  # logP(t|x,s)
 
+        # if span.start < 30:
+        #     logging.info("Span: " + span.text)
+        #     logging.info(f"pred_logp: {pred_logp}")
         # if prev_topic == -1: # for the first topic we will ignore the transition!!
         #     prev_topic = None
+        if self.probs is not None:
+            bins = self.probs.shape[0]
+            len_bins = 10
+            loc = 0.5 * (span.start+span.end)/len(span.doc)
+
         if prev_topic is not None:
             if self.mc is None:
+                # _p = 0.
+                if self.probs is not None:
+                    # bins = self.probs.shape[0]
+                    # loc = 0.5 * (span.start+span.end)/len(span.doc)
+                    # _p = np.log(self.probs[int(bins * loc), :])
+                    pred_logp += np.log(self.probs[int(bins * loc), :])
+                    # _pred_logp = pred_logp
+                    # logging.info(f"probs: {np.log(self.probs[int(bins * loc), :])}")
+                    # _p = pred_logp
                 pred_logp[prev_topic] = -np.inf  # no need to normalize since we choose the max. we do!!!
+                pred_logp = pred_logp - logsumexp(pred_logp)  # normalize?? for max it doesn't matter
+                if self.probs is not None:
+                    pred_logp -= np.log(self.probs[int(bins * loc), :])  # TODO
+                # logging.info(f"pred_logp2: {pred_logp}")
+                # pred_logp = pred_logp - _p  # /P(t|i)
             else:  # uses transition probabilities
                 with np.errstate(divide='ignore'):
                     # pred_logp = pred_logp + np.log(self.mc.predict_vector(prev_topic=prev_topic))
                     t_prob = np.log(self.mc.predict_vector(prev_topic=prev_topic)) - np.log(self.topics_prior)  # P(t_i|t_{i-1})/P(t_i)
                     pred_logp = pred_logp + t_prob
 
-            # pred_logp = pred_logp - logsumexp(pred_logp)  # normalize?? for max it doesn't matter
 
         if self.lm_scorer is None:
-            lm_logp = -len(span) * np.log(len(span.doc.vocab))  # logP(x|s)
+            lm_logp = -len(span) * np.log(len(span.doc.vocab))  # logP(x|s). This shouldn't have any effect
         else:
-            lm_logp = -self.lm_scorer.sentence_score(span.text)  # this is the LM loss so we need the minus to get the probability
+            # lm_logp = -self.lm_scorer.sentence_score(span.text)  # this is the LM loss so we need the minus to get the probability
+            lm_logp = -self.lm_scorer.sentence_score(sent=[s.text for s in spans])  # this is the LM loss so we need the minus to get the probability
+            # logging.info(f"lm_logp: {lm_logp}")
 
-        len_logp = poisson.logpmf(len(span) // self.prior_scale, self.prior_length // self.prior_scale) * np.ones(len(pred_logp)) # logP(s). Check for a more accurate prior!!
+        if self.probs is not None:
+            # logging.info(f"estimators: {self.len_estimators.predict(len=len(span), i=int(len_bins * loc))}")
+            # logging.info(f"bin: {int(len_bins * loc)}")
+            # logging.info(f"len(span), len(span.doc): {len(span)}, {len(span.doc)}")
+            factor = 1.  # larger factor means a LARGER penalty for long segments
+            len_logp = (self.len_estimators.predict(len=len(span) * factor, i=int(len_bins * loc)) / (len(span.doc) / len(span))
+                        + self.segments_estimator.predict(len(span.doc) * factor // len(span), i=0) / (len(span.doc) / len(span))) \
+                       * np.ones(len(pred_logp))
+            # len_logp = (5 * self.len_estimators.predict(len=len(span), i=int(len_bins * loc))) * np.ones(len(pred_logp))
+            # logging.info(f"len_logp: {len_logp}")
+        elif self.prior_scale is not None:
+            len_logp = poisson.logpmf(len(span) // self.prior_scale, self.prior_length // self.prior_scale) * np.ones(len(pred_logp)) # logP(s). Check for a more accurate prior!!
+        else:
+            len_logp = 0.
         if self.nt_prior_length is not None:
             len_logp[self.encoder.transform(["NO_TOPIC"])[0]] = poisson.logpmf(len(span) // self.nt_prior_scale, self.nt_prior_length // self.nt_prior_scale)
 
         logp = pred_logp + lm_logp + len_logp
+        # logging.info(f"logp: {logp}")
         return logp, pred_logp
 
     def predict_all(self, span, prev_topic=None):
@@ -187,7 +249,7 @@ class TransformerClassifier:
         logp, pred_logp = self._predict(span, prev_topic=prev_topic)
         return logp
 
-    def predict_max(self, span, prev_topic=None):
+    def predict_max(self, span, prev_topic=None, spans=None):
         """
         Predicts the max class for a given span
         :param span: spacy span to classify
@@ -226,7 +288,7 @@ class TransformerClassifier:
         # # #     marginal = np.log(list(self.mc.mc.distributions[1].marginal().parameters[0].values()))
         # #     logp = logp - self.marginal
 
-        logp, pred_logp = self._predict(span, prev_topic=prev_topic)
+        logp, pred_logp = self._predict(span, prev_topic=prev_topic, spans=spans)
 
         max_p = int(np.argmax(logp))
         return logp[max_p], pred_logp, max_p
@@ -260,13 +322,24 @@ class TransformerClassifier:
         return logsumexp(logp), pred_logp
 
     def predict_raw(self, text):
+        # logging.info(f"text len: {len(text)}")
+        if len(text) > 6000:
+            l = (len(text) - 6000) // 2
+            text = text[l:-l]
+            logging.info(f"text len2: {len(text)}")
         encodings = self.tokenizer(text, truncation=True, padding=True, return_tensors="pt")
         encodings.to(dev)
-        out = self.model(encodings['input_ids']).logits.detach()[0].cpu().numpy()
+        try:
+            # if len(span) < 1200:
+            out = self.model(encodings['input_ids']).logits.detach()[0].cpu().numpy()
+        except RuntimeError:
+            raise
+
+        # out = self.model(encodings['input_ids']).logits.detach()[0].cpu().numpy()
         # returns a tuple for the probability for best topic and index of the best topic, and also the probs for classification
         return np.ravel(log_softmax(out))  # logP(t|x,s)
 
-    def find_priors(self, mean=None, scale=10, nt_mean=None, nt_scale=20, r=None):
+    def find_priors(self, mean=None, scale=10, nt_mean=None, nt_scale=20, r=None, smoothing_factor=1):
         """
         Calculates the prior probabilities for the classes. if given then only saves.
         :param r: range of docs to estimate the average from
@@ -324,7 +397,8 @@ class TransformerClassifier:
         self.topics_prior = self.topics_prior / len(all_topics)
 
         # add some smoothing
-        smoothing_factor = 1/len(self.topics)
+        # smoothing_factor=1 means we give equal weight to uniform. 0 means no smoothing
+        smoothing_factor = smoothing_factor/len(self.topics)
         logging.info(f"smoothing factor: {smoothing_factor}")
         self.topics_prior += smoothing_factor
         self.topics_prior = self.topics_prior / sum(self.topics_prior)
@@ -379,7 +453,7 @@ class MultilabelTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 
-def train_model(base_path, name=None, label_smoothing_factor=0., weighted=False, save='model'):
+def train_model(base_path, name=None, label_smoothing_factor=0., weighted=False, save=None, label_type=None, with_bins=False):
     """
     Trains a transformer model using HuggingFace's trainer
     :param save_model: what to save - can be "model", "eval" or None
@@ -396,17 +470,54 @@ def train_model(base_path, name=None, label_smoothing_factor=0., weighted=False,
         predictions = np.argmax(logits, axis=-1)
         return metric.compute(predictions=predictions, references=labels)
 
+    r = ["sf_43019", "sf_38929", "sf_32788", "sf_38936", "sf_20505", "sf_23579", "sf_48155", "sf_35869", "sf_30751", "sf_30753",
+         "sf_25639", "sf_45091", "sf_32809", "sf_34857", "sf_46120", "sf_46122", "sf_30765", "sf_24622", "sf_21550", "sf_26672"]
+    r = [_r[3:] for _r in r]
+
     docs_path = base_path + '/data/docs/'
-    with open(docs_path + "data2.json", 'r') as infile:
-        data = json.load(infile)
-    data = [data_tuple for t_data in data.values() for data_tuple in t_data]
+    if label_type is None:
+        with open(docs_path + "data6.json", 'r') as infile:
+            data = json.load(infile)
+        data = [data_tuple for t, t_data in data.items() if t not in r for data_tuple in t_data]
+    elif label_type == "time":
+        with open(docs_path + "time_all.json", 'r') as infile:
+            data = json.load(infile)
+        with open(base_path + "/data/sf_nonrounds.json", 'r') as infile:
+            nonrounds = json.load(infile).keys()
+        data = [data_tuple for t, t_data in data.items() if t not in nonrounds for data_tuple in t_data]
     # np.random.shuffle(data)
     # store the inputs and outputs
-    texts, _, labels = list(zip(*data))
+    if label_type is None:
+        if with_bins:
+            texts, bins, labels = list(zip(*data))
+            texts = [t + " [SEP] " + str(b) for t, b in zip(texts, bins)]
+        else:
+            texts, _, labels = list(zip(*data))
+    elif label_type == "time":
+        texts, labels = list(zip(*data))
     encoder = LabelEncoder()
 
     train_texts, val_texts, train_labels, val_labels = train_test_split(texts, encoder.fit_transform(labels), test_size=.2)
     print("made data")
+
+    if label_type is None:
+        # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/deberta-large2'
+        # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/distilroberta'
+        out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/gpt2-3'
+    elif label_type == "time":
+        # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/xlnet-base-time'
+        out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/distilroberta-time'
+        # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/xlnet-large-time'
+    # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/distilbert-textcat'
+    # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/electra-textcat'
+    # out_path = base_path + 'models/electra-large-textcat'
+    # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/xlnet-base-textcat'
+    if "model" in save:
+        # model.save_pretrained(out_path)
+        # model = DistilBertForSequenceClassification.from_pretrained('/cs/snapless/oabend/eitan.wagner/segmentation/models/distilbert-textcat')
+        # print("Evaluating")
+        # print(trainer.evaluate())
+        joblib.dump(encoder, out_path + '/label_encoder.pkl')
 
     if weighted:
         global class_wts
@@ -415,20 +526,17 @@ def train_model(base_path, name=None, label_smoothing_factor=0., weighted=False,
         # logging.info(f"class_wts: {class_wts}")
 
     # tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased', cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
-    # tokenizer = ElectraTokenizer.from_pretrained('google/electra-base-discriminator', cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
-    # tokenizer = ElectraTokenizer.from_pretrained('google/electra-large-discriminator', cache_dir=CACHE_DIR)
-    # tokenizer = XLNetTokenizer.from_pretrained('xlnet-base-cased', cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
-    tokenizer = XLNetTokenizer.from_pretrained('xlnet-large-cased', cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
-    # tokenizer = RobertaTokenizer.from_pretrained('roberta-large', cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
-    # print('google/electra-large-discriminator')
-    # print('google/electra-base-discriminator')
-    # print('xlnet-base-cased')
-    print('xlnet-large-cased')
-    # print('roberta-large')
-    # print('distilbert-base-uncased')
+    # tokenizer = AutoTokenizer.from_pretrained('distilroberta-base', cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+    tokenizer = AutoTokenizer.from_pretrained('gpt2-large', cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+    # tokenizer = AutoTokenizer.from_pretrained('microsoft/deberta-v3-large', cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+    print('distilroberta')
+    # print('deberta-large')
 
+    tokenizer.pad_token = tokenizer.eos_token
     train_encodings = tokenizer(train_texts, truncation=True, padding=True)
+    # train_encodings = tokenizer(train_texts, truncation=True, padding=False)
     val_encodings = tokenizer(val_texts, truncation=True, padding=True)
+    # val_encodings = tokenizer(val_texts, truncation=True, padding=False)
     print("made encodings")
 
     train_dataset = SFDataset(train_encodings, train_labels)
@@ -437,7 +545,7 @@ def train_model(base_path, name=None, label_smoothing_factor=0., weighted=False,
 
     training_args = TrainingArguments(
         output_dir='./results',          # output directory
-        num_train_epochs=3,              # total number of training epochs
+        num_train_epochs=5,              # total number of training epochs
         learning_rate=5e-5 * 1/16,
         per_device_train_batch_size=1,  # batch size per device during training
         per_device_eval_batch_size=1,   # batch size for evaluation
@@ -449,29 +557,24 @@ def train_model(base_path, name=None, label_smoothing_factor=0., weighted=False,
         logging_dir='./logs',            # directory for storing logs
         logging_steps=10,
         evaluation_strategy="epoch",
+        save_strategy="epoch",
         load_best_model_at_end=True,
         label_smoothing_factor=label_smoothing_factor,
         # report_to=None,
     )
 
-    # model = DistilBertForSequenceClassification.from_pretrained("distilbert-base-uncased",
+    # model = AutoModelForSequenceClassification.from_pretrained("distilroberta-base",
     #                                                             cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
     #                                                             num_labels=len(encoder.classes_))
-    # # model = ElectraForSequenceClassification.from_pretrained('google/electra-base-discriminator',
-    #                                                             cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
-    #                                                             num_labels=len(encoder.classes_))
-    # model = ElectraForSequenceClassification.from_pretrained('google/electra-large-discriminator',
-    #                                                             cache_dir=CACHE_DIR,
-    #                                                             num_labels=len(encoder.classes_))
-    # # model = XLNetForSequenceClassification.from_pretrained('xlnet-base-cased',
-    #                                                             cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
-    #                                                             num_labels=len(encoder.classes_))
-    model = XLNetForSequenceClassification.from_pretrained('xlnet-large-cased',
-                                                           cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
-                                                           num_labels=len(encoder.classes_))
-    # model = RobertaForSequenceClassification.from_pretrained('roberta-large',
-    #                                                       cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
-    #                                                       num_labels=len(encoder.classes_))
+    model = AutoModelForSequenceClassification.from_pretrained("gpt2-large",
+                                                                cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
+                                                                num_labels=len(encoder.classes_))
+    # model = AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-v3-large",
+    #                                                            cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
+    #                                                            num_labels=len(encoder.classes_))
+    # model = XLNetForSequenceClassification.from_pretrained('xlnet-large-cased',
+    #                                                        cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
+    #                                                        num_labels=len(encoder.classes_))
     model.to(dev)
     # for name, param in model.named_parameters():
     #     if 'classifier' not in name: # classifier layer
@@ -508,24 +611,19 @@ def train_model(base_path, name=None, label_smoothing_factor=0., weighted=False,
     # )
     # trainer.train()
 
-    logging.info("\nEval at k")
-    logging.info(eval_at_k(model, val_encodings, val_labels, k=len(encoder.classes_)))
-    # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/roberta-large'
+    # logging.info("\nEval at k")
+    # logging.info(eval_at_k(model, val_encodings, val_labels, k=len(encoder.classes_)))
 
-    out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/xlnet-large-cased'
-    # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/distilbert-textcat'
-    # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/electra-textcat'
-    # out_path = base_path + 'models/electra-large-textcat'
-    # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/xlnet-base-textcat'
 
-    if save == "model":
+
+    if "model" in save:
         model.save_pretrained(out_path)
         # model = DistilBertForSequenceClassification.from_pretrained('/cs/snapless/oabend/eitan.wagner/segmentation/models/distilbert-textcat')
         # print("Evaluating")
         # print(trainer.evaluate())
-        joblib.dump(encoder, out_path + '/label_encoder.pkl')
+        # joblib.dump(encoder, out_path + '/label_encoder.pkl')
 
-    if save == "eval":
+    if "eval" in save:
         model.eval()
         tensors = torch.split(torch.tensor(val_encodings['input_ids'], dtype=torch.long), 1)
         preds = np.array([model(t.to(dev)).logits.detach().cpu().numpy().ravel() for t in tensors])  # should be a 2-d array
@@ -557,7 +655,7 @@ def eval_at_k(model, encodings, labels, k=None):
     return accs
 
 
-def find_correlations(path='/cs/snapless/oabend/eitan.wagner/segmentation/models/xlnet-large-cased'):
+def find_correlations(path='/cs/snapless/oabend/eitan.wagner/segmentation/models/deberta-large'):
     """
     Make correlation scores (should be from 0 to 1) between all labels
     :param path:
@@ -583,27 +681,30 @@ def cluster_correlations(path='/cs/snapless/oabend/eitan.wagner/segmentation/mod
     logging.info("clusters: ")
     logging.info(clusters)
 
+def _train():
+    base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
+    # model_names = ['distilbert-textcat', 'electra-large-textcat', 'xlnet-base-textcat']
+    label_smoothing_factor = 1e-2
+    # label_smoothing_factor = 1e-1
+    # label_smoothing_factor = 0
+    # logging.info(f"Smoothing factor: {label_smoothing_factor}")
+    # weighted = True
+    weighted = False
+    logging.info(f"Is weighted: {weighted}")
+
+    train_model(base_path=base_path, label_smoothing_factor=label_smoothing_factor,
+                weighted=weighted, save=["model", "eval"], label_type=None)
+
 if __name__ == '__main__':
     import logging
     logging.basicConfig(level=logging.INFO)
     import logging.config
     logging.config.dictConfig({'version': 1, 'disable_existing_loggers': True, })
+    _train()
+    # lengths.train(num_bins=10, segment_count=False)
+    # lengths.train(num_bins=1, segment_count=True)
 
-    find_correlations()
-
-
-    # base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
-    # model_names = ['distilbert-textcat', 'electra-large-textcat', 'xlnet-base-textcat']
-    # label_smoothing_factor = 1e-2
-    # # label_smoothing_factor = 1e-1
-    # # label_smoothing_factor = 0
-    # logging.info(f"Smoothing factor: {label_smoothing_factor}")
-    # # weighted = True
-    # weighted = False
-    # logging.info(f"Is weighted: {weighted}")
-    #
-    # train_model(base_path=base_path, label_smoothing_factor=label_smoothing_factor,
-    #             weighted=weighted, save="eval")
     # # for name in model_names[1:2]:
     # #     evaluate(base_path + "models/" + name)
     #
+    # find_correlations(path='/cs/snapless/oabend/eitan.wagner/segmentation/models/deberta-large2')

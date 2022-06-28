@@ -73,7 +73,8 @@ def make_corpus(data, return_lemmatized=False):
     :return: corpus (in bow format) and the id2word dict.
         if return_lemmatized then return the lemmatized list (with words) instead of id2word
     """
-    lemmatized = [lemmatize(text) for text in data]  # list of tokenized texts
+    _data = [" ".join(_words) for text in data for _words in np.array_split(text.split(), len(text.split())//200) ]
+    lemmatized = [lemmatize(text) for text in _data]  # list of tokenized texts
     id2word = corpora.Dictionary(lemmatized)
     id2word.filter_extremes(no_below=20, no_above=0.5)
     corpus = [id2word.doc2bow(text) for text in lemmatized]
@@ -133,14 +134,17 @@ if __name__ == '__main__':
     logging.config.dictConfig({'version': 1, 'disable_existing_loggers': True, })
 
     with open(data_path + 'sf_raw_text.json', 'r') as infile:
-        texts = list(json.load(infile).values())
+        data = json.load(infile)
+    with open(data_path + 'sf_unused.json', 'r') as infile:
+        unused = json.load(infile)
+    texts = [text for t, text in data.items() if int(t) not in unused]
 
-    nums = []
-    for n in nums:
-        logging.info(f"n: {n}")
-        train_lda(texts, num_topics=n, save=True)
+    # nums = [30]
+    # for n in nums:
+    #     logging.info(f"n: {n}")
+    #     train_lda(texts, num_topics=n, save=True)
 
-    nums = [5, 10, 15, 20]
+    nums = [30]
     corpus, lemmatized = make_corpus(texts)
     logging.info("Made corpus")
     mdl_perplixity(nums=nums, corpus=corpus, lemmatized=lemmatized, coherence=False)

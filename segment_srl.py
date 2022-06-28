@@ -33,6 +33,8 @@ os.environ['HF_METRICS_CACHE'] = CACHE_DIR
 
 span_extensions = ["ent_type", "srls", "arg0", "arg1", "verb", "verb_id", "arg0_id", "arg1_id"]  # for removing
 token_extensions = ["ent_span", "srl_span", "arg0_span", "arg1_span", "verb_span"]
+Doc.set_extension("srl2sent", default=None, force=True)
+Doc.set_extension("sent2srls", default=None, force=True)
 
 def add_extensions():
     for ext in span_extensions:
@@ -132,14 +134,73 @@ class Referencer:
 
 
 class SRLer:
-    def __init__(self, nlp):
+    def __init__(self, nlp=None, for_features=False):
         self.predictor = Predictor.from_path("https://storage.googleapis.com/allennlp-public-models/structured-prediction-srl-bert.2020.12.15.tar.gz")
         self.predictor._model = self.predictor._model.to(dev)
         # self.nlp = nlp
 
-        # self.verbs = (v for v in self.nlp.vocab if v.pos_ == "VERB")
-        nltk.download('propbank')
-        self.verbs = propbank.verbs()
+        if for_features:
+            # self.verbs = (v for v in self.nlp.vocab if v.pos_ == "VERB")
+            nltk.download('propbank')
+            self.verbs = propbank.verbs()
+
+
+    def sent_parse(self, doc, events=False):
+        """
+        NEW
+        :param doc:
+        :return:
+        """
+        # find srls and add to doc
+        doc.spans["srls"] = []
+        doc.spans["sents"] = [s for s in doc.sents]
+        doc._.srl2sent = []
+        doc._.sent2srls = []
+        srl_count = 0
+        for i, s in enumerate(doc.sents):
+            srl = self.predictor.predict(s.text)
+            if events:  # take only srls with events
+                locs = [[i for i, t in enumerate(v['tags']) if t != 'O'] for v in srl['verbs']
+                        if np.any(np.array(v['tags']) != "O") and sum([tok._.is_event for tok in s]) > 0]  # TODO: this takes all srls if one is an event
+            else:
+                locs = [[i for i, t in enumerate(v['tags']) if t != 'O'] for v in srl['verbs']
+                    if np.any(np.array(v['tags']) != "O")]
+
+            # print(locs)
+
+            # TODO combine overlapping srls
+            # take longest??
+            if len(locs) > 1:
+                loc_lens = [len(loc) for loc in locs]
+                max_len = np.argmax(loc_lens)
+                locs = [locs[max_len]]
+            # new_locs = []
+            # loc = []
+            # for j, l in enumerate(locs):
+            #     if len(loc) == 0:
+            #         loc = list(range(l[0], l[-1]+1))
+            #     else:
+            #         if l[0] > loc[-1] + 1 or l[-1] + 1 < loc[0]:
+            #             new_locs.append(list(loc))
+            #             loc = []
+            #             continue
+            #         else:
+            #             loc = list(range(min(loc[0], l[0]), l[-1]+1))
+            #     if j == len(locs)-1 or locs[j+1][0] > l[-1] + 1:  # non adjacent o overlapping
+            #         if len(loc) > 0:
+            #             new_locs.append(list(loc))
+            #         loc = []
+            # locs = new_locs[:]
+
+            for l in locs:
+                # print(i)
+                # print(l)
+                srl_span = doc[s.start + l[0]: s.start + l[-1]]
+                doc.spans["srls"].append(srl_span)
+                doc._.srl2sent.append(i)
+            doc._.sent2srls.append(list(range(srl_count, srl_count + len(locs))))
+            srl_count += len(locs)
+
 
     def parse(self, text):
         # TODO: take care of long texts!!!

@@ -16,35 +16,64 @@ else:
 
 # from transformers import GPT2Tokenizer, GPT2LMHeadModel
 from transformers import GPT2TokenizerFast, GPT2LMHeadModel
+from gpt_j import J1API
 
 # MAX_LEN, MIN_LEN = 1000, 35
 MAX_LEN, MIN_LEN = 800, 35
 
 
 class GPT2Scorer:
-    def __init__(self, base_path='/cs/snapless/oabend/eitan.wagner/segmentation/'):
-        self.tokenizer = GPT2TokenizerFast.from_pretrained('gpt2', cache_dir='/cs/snapless/oabend/eitan.wagner/cache/')
-        self.model = GPT2LMHeadModel.from_pretrained('gpt2', cache_dir='/cs/snapless/oabend/eitan.wagner/cache/')
-        self.model.to(dev)
+    def __init__(self, base_path='/cs/snapless/oabend/eitan.wagner/segmentation/', window=0, large=False, xlarge=False,
+                 from_path=None, gpt_j=False):
+        self.gpt_j = gpt_j
+        self.gpt_j_suffix = ""
+        print(f"gpt_j: {gpt_j}")
+        if gpt_j:
+            self.model = J1API()
+            self.gpt_j_suffix = "-j"
+            self.large = ""
+            self.fp = ""
+        else:
+            if large:
+                if xlarge:
+                    self.large = '-xl'
+                else:
+                    self.large = '-large'
+            else:
+                self.large = ''
+            if from_path is not None and from_path != "":
+                self.fp = '-fp'
+            else:
+                self.fp = ''
+            self.tokenizer = GPT2TokenizerFast.from_pretrained('gpt2'+self.large, cache_dir='/cs/snapless/oabend/eitan.wagner/cache/')
+            if not from_path:
+                self.model = GPT2LMHeadModel.from_pretrained('gpt2'+self.large, cache_dir='/cs/snapless/oabend/eitan.wagner/cache/')
+            else:
+                self.model = GPT2LMHeadModel.from_pretrained(from_path, cache_dir='/cs/snapless/oabend/eitan.wagner/cache/')
+
+
+            self.model.eval()
+            self.model.to(dev)
 
         self.base_path = base_path
         self.cache = {}
         self.cache_id = None
+        self.window = window
 
     def save_cache(self):
-        np.save(self.base_path + f"/gpt2_cache{str(self.cache_id)}.npy", self.cache)
+        np.save(self.base_path + f"/gpt2_cache{str(self.cache_id)}{self.large}{self.fp}{self.gpt_j_suffix}.npy", self.cache)
 
     def load_cache(self, i):
         self.cache_id = i
         try:
-            self.cache = np.load(self.base_path + f"/gpt2_cache{str(i)}.npy",
+            self.cache = np.load(self.base_path + f"/gpt2_cache{str(i)}{self.large}{self.fp}{self.gpt_j_suffix}.npy",
                                  allow_pickle='TRUE').item()
         except IOError as err:
             # except:
             pass
 
 
-    def sliding(self, encodings):
+    def sliding(self, encodings, past=None):
         """
         Calculate the loss using a sliding window.
         Taken from HuggingFace.
@@ -64,30 +93,76 @@ class GPT2Scorer:
             target_ids[:, :-trg_len] = -100
 
             with torch.no_grad():
-                outputs = self.model(input_ids, labels=target_ids)
+                outputs = self.model(input_ids, labels=target_ids, past_key_values=past)
                 neg_log_likelihood = outputs[0] * trg_len
 
             nlls.append(neg_log_likelihood)
 
         # ppl = torch.exp(torch.stack(nlls).sum() / end_loc)
-        return torch.stack(nlls).sum().cpu().numpy()
+        return torch.stack(nlls).detach().sum().cpu().numpy()
 
-    def sentence_score(self, sent):
+    def _window_score(self, sents):
+        score = 0.
+        for i, s in enumerate(sents):
+            if i == 0:
+                past_key_values = None
+            else:
+                past = " ".join(sents[max(i-self.window, 0): i])
+                past_inputs = self.tokenizer(past, return_tensors="pt")
+                past_inputs = past_inputs.to(dev)
+                past_key_values = self.model(input_ids=past_inputs['input_ids'])['past_key_values']
+
+            sent = " ".join(sents[i: i+self.window])
+            if sent in self.cache.keys():
+                out = self.cache[sent]
+            else:
+                inputs = self.tokenizer(sent, return_tensors="pt")
+                # print(inputs['input_ids'].shape)
+                inputs = inputs.to(dev)
+                out = self.model(input_ids=inputs['input_ids'], labels=inputs['input_ids'],
+                                 past_key_values=past_key_values)['loss'].detach().cpu().item() \
+                      * inputs['input_ids'].shape[1]
+                self.cache[sent] = out
+
+            score += out
+        return score
+
+
+    def sentence_score(self, sent, past=""):
+        if self.window > 0:  # in this case sent is actually a list
+            return self._window_score(sent)
+
         # TODO: is this the probability or the loss??
-        if sent in self.cache.keys():
-            return self.cache[sent]
+        if (sent, past) in self.cache.keys():
+            if self.gpt_j:
+                return -self.cache[(sent, past)]
+            return self.cache[(sent, past)]
 
-        # returns sentence probability (in log space)
+        if self.gpt_j:
+            out = self.model.get_log_likelihood(prompt=sent, return_sum=True)
+            self.cache[(sent, past)] = out
+            return -out
+
+        if len(past) > 0:
+            past_inputs = self.tokenizer(past, return_tensors="pt")
+            past_inputs = past_inputs.to(dev)
+            past_key_values = self.model(input_ids=past_inputs['input_ids'])['past_key_values']
+        else:
+            past_key_values = None
+            # returns sentence probability (in log space)
+
         inputs = self.tokenizer(sent, return_tensors="pt")
         # print(inputs['input_ids'].shape)
         inputs = inputs.to(dev)
 
         if inputs.input_ids.size(1) > 1000:
-            out = self.sliding(inputs)
+            out = self.sliding(inputs, past=past_key_values)
 
         else:
-            out = self.model(input_ids=inputs['input_ids'], labels=inputs['input_ids'])['loss'].item() * inputs['input_ids'].shape[1]
-        self.cache[sent] = out
+            out = self.model(input_ids=inputs['input_ids'], labels=inputs['input_ids'],
+                             past_key_values=past_key_values)['loss'].detach().cpu().item() \
+                  * inputs['input_ids'].shape[1]
+        self.cache[(sent, past)] = out
         return out
 
         # check why this doesn't work!!
