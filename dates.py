@@ -3,6 +3,15 @@ import json
 import numpy as np
 import re
 import pandas as pd
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import f1_score
+
+import torch
+import tqdm
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import joblib
+dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
 # import enum
 # class Times(enum.Enum):
@@ -308,39 +317,8 @@ class Dataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.labels)
 
-def train_classifier(data_path, return_data=False):
-    from sklearn.model_selection import train_test_split
-    from transformers import Trainer, TrainingArguments
-    from transformers import DebertaV2Tokenizer, DebertaV2ForSequenceClassification
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-    from sklearn.metrics import accuracy_score
-    from datasets import load_metric
-    from sklearn.preprocessing import LabelEncoder
-    import joblib
-
-
-    if torch.cuda.is_available():
-        dev = torch.device("cuda:0")
-        print("Running on the GPU")
-    else:
-        dev = torch.device("cpu")
-        print("Running on the CPU")
-
-    metric = load_metric("accuracy")
-
-    def compute_metrics(eval_pred):
-        logits, labels = eval_pred
-        predictions = np.argmax(logits, axis=-1)
-        return metric.compute(predictions=predictions, references=labels)
-
-    # with open(data_path + "locs_w_cat.json", 'r') as infile:
-    with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
-        data = json.load(infile)
-    with open(data_path + "sf_unused5.json", 'r') as infile:
-        unused = json.load(infile) + ['45064']
-
-    # locs = []
+def _make_texts(data, unused, out_path):
     texts = []
     labels = []
     for t, t_data in data.items():
@@ -369,12 +347,59 @@ def train_classifier(data_path, return_data=False):
                 # locs.append(prev_loc)
                 # texts.append((prev_text, prev_loc))
                 text = d[0]
-                texts.append(" [SEP] ".join([prev_loc[0], prev_text, prev_loc[1], text]))
+                if out_path[-1] == "1":  # deberta1
+                    texts.append(" [SEP] ".join([text]))
+                elif out_path[-1] == "2":  # deberta2
+                    texts.append(" [SEP] ".join([prev_loc[0], prev_text, prev_loc[1]]))
+                elif out_path[-1] == "3":  # deberta2
+                    texts.append(" [SEP] ".join([prev_loc[0], prev_loc[1]]))
+                else:
+                    texts.append(" [SEP] ".join([prev_loc[0], prev_text, prev_loc[1], text]))
 
                 # prev_text = " ".join(d[0].split()[-100:])
                 prev_text = text
                 prev_loc = [prev_loc[-1], d[1]]
+    return texts, labels
 
+def train_classifier(data_path, return_data=False, out_path=None, test_size=0.):
+    from sklearn.model_selection import train_test_split
+    from transformers import Trainer, TrainingArguments
+    from transformers import DebertaV2Tokenizer, DebertaV2ForSequenceClassification
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    from sklearn.metrics import accuracy_score
+    from datasets import load_metric
+    from sklearn.preprocessing import LabelEncoder
+    import joblib
+
+
+    if torch.cuda.is_available():
+        dev = torch.device("cuda:0")
+        print("\nRunning on the GPU")
+    else:
+        dev = torch.device("cpu")
+        print("\nRunning on the CPU")
+
+    metric = load_metric("accuracy")
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        predictions = np.argmax(logits, axis=-1)
+        return metric.compute(predictions=predictions, references=labels)
+
+    # with open(data_path + "locs_w_cat.json", 'r') as infile:
+    with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
+        data = json.load(infile)
+        if test_size > 0:
+            train_data = {t: text for t, text in list(data.items())[:-int(test_size * len(data))]}
+            val_data = {t: text for t, text in list(data.items())[-int(test_size * len(data)):]}
+        else:
+            train_data = data
+    with open(data_path + "sf_unused5.json", 'r') as infile:
+        unused = json.load(infile) + ['45064']
+
+    # locs = []
+    texts, labels = _make_texts(train_data, unused, out_path)
         # labels.append("END")
         # locs.append(prev_loc)
         # texts.append(" [SEP] ".join([prev_loc[0], prev_text, prev_loc[1], text]))
@@ -382,9 +407,16 @@ def train_classifier(data_path, return_data=False):
 
     encoder = LabelEncoder()
 
-    train_texts, val_texts, train_labels, val_labels = train_test_split(texts, encoder.fit_transform(labels), test_size=.2)
+    if test_size == 0:
+        train_texts, val_texts, train_labels, val_labels = train_test_split(texts, encoder.fit_transform(labels), test_size=.2, random_state=42)
+    else:
+        val_texts, val_labels = _make_texts(val_data, unused, out_path)
+        encoder.fit(labels + val_labels)
+        val_labels = encoder.transform(val_labels)
+        train_texts, train_labels = texts, encoder.transform(labels)
     print("made data")
-    out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/deberta'
+    print(f"*************** {out_path.split('/')[-1]} **************")
+    # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/deberta1'
     joblib.dump(encoder, out_path + '/label_encoder.pkl')
 
     tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
@@ -403,9 +435,9 @@ def train_classifier(data_path, return_data=False):
         output_dir='./results',          # output directory
         num_train_epochs=5,              # total number of training epochs
         learning_rate=5e-5,
-        per_device_train_batch_size=2,  # batch size per device during training
-        per_device_eval_batch_size=2,   # batch size for evaluation
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=4,  # batch size per device during training
+        per_device_eval_batch_size=4,   # batch size for evaluation
+        gradient_accumulation_steps=2,
         # learning_rate=5e-5,
         # per_device_train_batch_size=16,  # batch size per device during training
         # per_device_eval_batch_size=64,   # batch size for evaluation
@@ -434,8 +466,16 @@ def train_classifier(data_path, return_data=False):
     trainer.train()
     model.save_pretrained(out_path)
 
+    # if return_data:
+    return train_dataset, val_dataset
 
-def evaluate(model_path, dataset):
+
+def print_scores(preds, y):
+    print("Accuracy: ", accuracy_score(y, preds))
+    print("Balanced Accuracy: ", balanced_accuracy_score(y, preds))
+    print("F1 macro: ", f1_score(y, preds, average='macro'))
+
+def evaluate(model_path, val_dataset):
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
     import joblib
 
@@ -449,74 +489,327 @@ def evaluate(model_path, dataset):
     tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
     model = AutoModelForSequenceClassification.from_pretrained(model_path,
                                                                cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
-                                                               num_labels=len(encoder.classes_))
+                                                               num_labels=len(encoder.classes_)).to(dev)
 
     model.eval()
-    val_labels = dataset.labels[:30]
+    val_labels = val_dataset.labels[:]
     val_real = encoder.inverse_transform(val_labels)
-    val_encodings = dataset.encodings
-    val_texts = tokenizer.batch_decode(val_encodings['input_ids'][:30], skip_special_tokens=True)
-    tensors = torch.split(torch.tensor(val_encodings['input_ids'][:30], dtype=torch.long), 1)
+    val_encodings = val_dataset.encodings
+    val_texts = tokenizer.batch_decode(val_encodings['input_ids'][:], skip_special_tokens=True)
+    tensors = torch.split(torch.tensor(val_encodings['input_ids'][:], dtype=torch.long), 1)
     preds = np.array([model(t.to(dev)).logits.detach().cpu().numpy().ravel() for t in tensors])  # should be a 2-d array
-    preds = encoder.inverse_transform(np.argmax(preds, axis=1).astype(int))
+    pred_labels = np.argmax(preds, axis=1).astype(int)
+    preds = encoder.inverse_transform(pred_labels)
+
+    print_scores(preds=pred_labels, y=val_labels)
+
     t_p_r = [[text, pred, real] for text, pred, real in zip(val_texts, preds, val_real)]
     with open(model_path + 'preds.json', 'w') as outfile:
         json.dump(t_p_r, outfile)
-    print(preds)
+    print(preds[:50])
 
 
+# **************** generate and evaluate ******************8
+
+def greedy_decode(model, tokenizer, encoder, test_data, only_loc=False):
+    """
+
+    :param model:
+    :param texts: list of formatted texts for a testimony
+    :param labels: real labels (for evaluation)
+    :return:
+    """
+    texts, labels = _make_texts(test_data, unused=[], out_path="1")  # only current text
+    model.eval()
+    output_sequence = []
+    prev_text = ""
+    _locs = ["START", "START"]
+    for text in texts:
+        if only_loc:
+            t = " [SEP] ".join([_locs[-2], _locs[-1]])
+        else:
+            t = " [SEP] ".join([_locs[-2], prev_text, _locs[-1]] + [text])
+        encoding = tokenizer(t, truncation=True, padding=True)
+        # encoding = torch.split(torch.tensor(encoding['input_ids'], dtype=torch.long), 1)
+        encoding = torch.tensor(encoding['input_ids'], dtype=torch.long).to(dev)
+        prediction = model(encoding.unsqueeze(0))
+        output_sequence.append(int(np.argmax(prediction.logits[0].detach().cpu().numpy())))
+        _locs = [_locs[-1]] + list(encoder.inverse_transform(output_sequence[-1:]))
+        prev_text = text
+    return output_sequence, encoder.transform(labels)
+
+def beam_decode(model, tokenizer, encoder, test_data, k=3, only_loc=False):
+    """
+
+    :param model:
+    :param texts: list of formatted texts for a testimony
+    :param labels: real labels (for evaluation)
+    :return:
+    """
+    #fix!!!
+    texts, labels = _make_texts(test_data, unused=[], out_path="1")  # only current text
+    model.eval()
+    #start with an empty sequence with zero score
+    # output_sequences = [([], 0)]
+    output_sequences = [(["START", "START"], 0)]
+
+    prev_text = ""
+    # _locs = ["START", "START"]
+    for text in texts:
+        new_sequences = []
+
+        for old_seq, old_score in output_sequences:
+            if only_loc:
+                t = " [SEP] ".join([old_seq[-2], old_seq[-1]])
+            else:
+                t = " [SEP] ".join([old_seq[-2], prev_text, old_seq[-1]] + [text])
+            encoding = tokenizer(t, truncation=True, padding=True)
+            # encoding = torch.split(torch.tensor(encoding['input_ids'], dtype=torch.long), 1)
+            encoding = torch.tensor(encoding['input_ids'], dtype=torch.long).to(dev)
+            prediction = model(encoding.unsqueeze(0))
+            _probs = torch.log_softmax(prediction.logits[0].detach().cpu(), dim=-1).numpy()
+
+            for char_index in range(len(_probs)):
+                new_seq = old_seq + encoder.inverse_transform([char_index]).tolist()
+                #considering log-likelihood for scoring
+                new_score = old_score + _probs[char_index]
+                # new_score = old_score + np.log(_probs[char_index])
+                new_sequences.append((new_seq, new_score))
+
+        #sort all new sequences in the decreasing order of their score
+        output_sequences = sorted(new_sequences, key=lambda val: val[1], reverse=True)
+        #select top-k based on score
+        # *Note- best sequence is with the highest score
+        output_sequences = output_sequences[:k]
+
+        # _locs = [_locs[-1]] + list(encoder.inverse_transform(output_sequence[-1:]))
+        prev_text = text
+    return output_sequences, encoder.transform(labels)
+
+
+class LocCRF:
+    def __init__(self, model_path, use_prior=''):
+        from TorchCRF import CRF
+        self.model_path = model_path
+        self.encoder = joblib.load(model_path + "/label_encoder.pkl")
+        self.tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_path,
+                                                               cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
+                                                               num_labels=len(self.encoder.classes_)).to(dev)
+
+        pad_idx = None
+        if use_prior == 'I':
+            pad_idx = np.arange(len(self.encoder.classes_))
+        self.crf = CRF(len(self.encoder.classes_), pad_idx=pad_idx)
+        self.prior = use_prior
+        # set self.crf.trans_matrix ?
+        # self.crf.trans_matrix = nn.Parameter(torch.diag(torch.ones(len(self.encoder.classes_))))
+        # set by pairwise distance??
+
+
+    def _forward(self, texts):
+        self.model.to(dev)
+        hidden = np.zeros((len(texts), max([len(t) for t in texts]), len(self.encoder.classes_)))
+        if len(texts) == 0:
+            return torch.from_numpy(hidden).to(dev)
+        for k, text in enumerate(texts):
+            # encodings = [torch.tensor(self.tokenizer(t, truncation=True, padding=True)['input_ids'], dtype=torch.long).to(dev) for t in text]
+            encodings = torch.tensor(self.tokenizer(text, truncation=True, padding=True)['input_ids'], dtype=torch.long).to(dev)
+            # print(encodings)
+            # probs = [self.model(e.unsqueeze(0)).logits[0].detach().cpu().numpy() for e in encodings]
+            # print([self.model(e.unsqueeze(0)).logits[0].detach() for e in encodings])
+            probs = np.array([self.model(e.unsqueeze(0).to(dev)).logits[0].detach().cpu().numpy() for e in encodings])
+            # probs = self.model(encodings).logits.detach().cpu().numpy()
+            hidden[k, :probs.shape[0], :probs.shape[1]] = probs
+        self.model.cpu()
+        hidden = torch.from_numpy(hidden).to(dev)
+        hidden.requires_grad_()
+        return hidden
+
+    def train(self, train_data, batch_size=4, epochs=10):
+        print(f"Training. Batch size: {batch_size}, epochs: {epochs}")
+        self.prior = self.prior + f"_b{batch_size}_e{epochs}"
+        import random
+        import torch.optim as optim
+        # import torch.nn as nn
+        self.model.eval()  # don't train model
+        optimizer = optim.Adam(self.crf.parameters())
+        # criterion = nn.CrossEntropyLoss()
+        self.crf = self.crf.to(dev)
+        # criterion = criterion.to(dev)
+
+        _train = list(train_data.values())[:int(len(train_data) * 0.9)]
+        # _train = list(train_data.items())[:int(len(train_data) * 0.9)]
+        for e in range(epochs):
+            losses = []
+            print("\n" + str(e))
+            sys.stdout.flush()
+            random.shuffle(_train)
+            for i in tqdm.tqdm(range(0, len(_train), batch_size)):
+                # for t, t_data in tqdm.tqdm(list(train_data.items())[:int(len(train_data) * 0.9)]):
+                train_batch = _train[i: i+batch_size]
+
+                texts = []
+                label_mask = np.zeros((batch_size, max([len(t) for t in train_batch])), dtype=bool)
+                labels = np.zeros((batch_size, max([len(t) for t in train_batch])), dtype=int)
+
+                for j, _t in enumerate(train_batch):
+                    _texts, _labels = _make_texts({1: _t}, unused=[], out_path="1")  # only current text
+                    label_mask[j, :len(_t)] = 1
+                    labels[j, :len(_t)] = self.encoder.transform(_labels)
+                    texts.append(_texts)
+                    # labels.append(_labels)
+
+                optimizer.zero_grad()
+                hidden = self._forward(texts)
+
+                mask = torch.from_numpy(label_mask).to(dev)
+                # mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
+                # print(label)
+                labels = torch.from_numpy(labels).to(dev)
+                # labels = torch.LongTensor(self.encoder.transform(labels)).unsqueeze(0).to(dev)  # (batch_size, sequence_size)
+
+                loss = self.crf.forward(hidden, labels, mask).mean()
+                # loss = criterion(y_pred, label)
+                loss.backward()
+                optimizer.step()
+                losses.append(loss.item())
+                # print(loss.item())
+            print("Epoch loss:", np.mean(losses))
+        return self
+
+    def decode(self, test_data):
+
+        texts, labels = _make_texts(test_data, unused=[], out_path="deberta")  # only current text
+        self.model.eval()
+
+        hidden = self._forward([texts])
+        hidden.detach()
+        mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
+
+        return self.crf.viterbi_decode(hidden, mask)[0], labels  # predictions and labels
+
+    def save_model(self):
+        print("Saving model " + f'/crf_{self.prior}.pkl')
+        joblib.dump(self, self.model_path + f'/crf_{self.prior}.pkl')
+
+
+def _eval(pred, labels):
+    from evaluation import edit_distance, gestalt_diff
+    ed, sm = edit_distance(pred, labels), gestalt_diff(pred, labels)
+    # print("Edit distance: ", ed)
+    # print("Sequence Matching: ", sm)
+    return ed, sm
+
+
+def decode(data_path, model_path, only_loc=False, test_size=0.):
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    import joblib
+
+    if torch.cuda.is_available():
+        dev = torch.device("cuda:0")
+    else:
+        dev = torch.device("cpu")
+
+    encoder = joblib.load(model_path + "/label_encoder.pkl")
+
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+    model = AutoModelForSequenceClassification.from_pretrained(model_path,
+                                                               cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
+                                                               num_labels=len(encoder.classes_)).to(dev)
+
+    with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
+        data = json.load(infile)
+
+    if test_size > 0:
+        test_data = {t: text for t, text in list(data.items())[-int(test_size * len(data)):]}  # !!!!
+    else:
+        test_data = {t: text for t, text in list(data.items())[-5:]}  #!!!!
+
+    eds_g, sms_g = [], []
+    eds_b, sms_b = [], []
+
+    for t, t_data in test_data.items():
+        pred, labels = greedy_decode(model, tokenizer, encoder, test_data={t: t_data}, only_loc=only_loc)
+        # print(encoder.inverse_transform(pred[:10]))
+        # print(encoder.inverse_transform(labels[:10]))
+        ed_g, sm_g = _eval(pred, labels)
+        preds, labels = beam_decode(model, tokenizer, encoder, test_data={t: t_data}, k=3, only_loc=only_loc)
+        ed_b, sm_b = _eval(encoder.transform(preds[0][0]), labels)
+        # print(preds[0][0][:10])
+        # print(encoder.inverse_transform(labels[:10]))
+
+        eds_g.append(ed_g / len(labels))
+        eds_b.append(ed_b / len(labels))
+        sms_g.append(sm_g)
+        sms_b.append(sm_b)
+    print("Greedy")
+    print("Edit: " + str(np.mean(eds_g)))
+    print("SM: " + str(np.mean(sms_g)))
+    print("Beam")
+    print("Edit: " + str(np.mean(eds_b)))
+    print("SM: " + str(np.mean(sms_b)))
+    print("Done")
+
+def crf_decode(data_path, model_path, test_size=0., use_prior='', batch_size=4, epochs=10):
+    with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
+        data = json.load(infile)
+
+    if test_size > 0:
+        train_data = {t: text for t, text in list(data.items())[:-int(test_size*len(data))]}
+        test_data = {t: text for t, text in list(data.items())[-int(test_size*len(data)):]}  #!!!!
+    else:
+        train_data = data
+    loc_crf = LocCRF(model_path, use_prior=use_prior).train(train_data, batch_size=batch_size, epochs=epochs)
+    loc_crf.save_model()
+
+def crf_eval(data_path, model_path, test_size=0., use_prior=''):
+    encoder = joblib.load(model_path + "/label_encoder.pkl")
+    with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
+        data = json.load(infile)
+    loc_crf = joblib.load(model_path + f'/crf_{use_prior}.pkl')
+
+    if test_size > 0:
+        test_data = {t: text for t, text in list(data.items())[-int(test_size * len(data)):]}  # !!!!
+
+        eds, sms = [], []
+        print("CRF")
+        for t, t_data in test_data.items():
+            pred, labels = loc_crf.decode(test_data={t: t_data})
+            # print(encoder.inverse_transform(pred[:10]))
+            # print(labels[:10])
+            ed, sm = _eval(pred, encoder.transform(labels))
+            eds.append(ed/len(labels))
+            sms.append(sm)
+        print("Edit: " + str(np.mean(eds)))
+        print("SM: " + str(np.mean(sms)))
+    print("Done")
 
 
 if __name__ == "__main__":
+    import sys
     base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
     data_path = base_path + 'data/'
-    model_path = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/deberta"
+    # prior = ''
+    prior = 'I'
+    print("Prior: " + prior)
+
     # make_loc_data(data_path, use_segments=True, with_cat=True, with_country=True)
     # make_loc_data(data_path, use_segments=False, with_cat=True, with_country=True)
     # make_loc_data(data_path, use_segments=False, with_cat=True)
     # make_time_data(data_path)
-    train_dataset, val_dataset = train_classifier(data_path, return_data=True)
-    evaluate(model_path, dataset=val_dataset)
-    pass
-    # with open("C:/Users/Eitan/nlplab/raw_text.json", "r") as infile:
-    #     texts = json.load(infile)
-    # nlp2 = spacy.load("en_core_web_trf")
-    # # t = "103"
-    # ts = list(texts.keys())[:]
-    # # ts = range(144, 155)
-    # events = []
-    # all_X, all_Y = [], []
-    # all_X_n = np.array([])
-    # for _t in ts:
-    #     t = str(_t)
-    #     doc2_2 = nlp2(texts[t])
-    #
-    #     sent2i = {s.text: i for i, s in enumerate(doc2_2.sents)}
-    #
-    #     X, Y = [], []
-    #     for e in doc2_2.ents:
-    #         if e.label_ == "EVENT":
-    #             events.append((e.text, t, e.start))
-    #         if e.label_ == "DATE":
-    #             y = get_year(e)
-    #             if y is not None:
-    #                 # print(y, e.start)
-    #                 Y.append(y)
-    #                 # X.append(e.start)
-    #                 X.append(sent2i[e.sent.text])
-    #                 # print(e.text)
-    #                 # print(e.start)
-    #     print(f"\nT: {t}")
-    #     # print(len(X))
-    #     # print(X)
-    #     # print(Y)
-    #     t_len = len([s for s in doc2_2.sents])
-    #     all_X = all_X + X
-    #     all_Y = all_Y + Y
-    #     all_X_n = np.concatenate([all_X_n, 100 * np.array(X) / t_len])
-    #     # print("Sents: ", t_len)
-    #     plot(X, Y, t=f"Testimony: {t}, ents: {len(X)}", t_len=t_len, save=True, t_num=_t)
-    #
-    # print(events)
-    # plot(all_X, all_Y, t=f"All", t_len=3000, save=True, t_num="all")
-    # plot(all_X_n, all_Y, t=f"All_n", t_len=100, save=True, t_num="all_n")
+    # for model_name in ["deberta3", "deberta", "deberta1", "deberta2"]:
+    for model_name in ["deberta1"]:
+    # for model_name in ["deberta"]:
+        print(model_name)
+        model_path = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/" + model_name
+        # train_dataset, val_dataset = train_classifier(data_path, return_data=False, out_path=model_path, test_size=0.2)
+        # train_dataset, val_dataset = train_classifier(data_path, return_data=True, out_path=model_path)
+
+        crf_decode(data_path, model_path, test_size=0.2, use_prior=prior, batch_size=10, epochs=20)
+        crf_eval(data_path, model_path, test_size=0.2, use_prior=prior)
+
+        # evaluate(model_path, val_dataset=val_dataset)
+        #
+    model_name = "deberta"
+    decode(data_path, model_path, test_size=0.2, only_loc=(True if model_name == "deberta3" else False))
