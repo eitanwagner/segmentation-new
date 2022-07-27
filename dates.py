@@ -343,7 +343,18 @@ class Dataset(torch.utils.data.Dataset):
         return len(self.labels)
 
 
+def _add_loc_description(labels, desc_dict):
+    return [l + ". " + desc_dict[l] for l in labels], labels
+
 def _make_texts(data, unused, out_path, desc_dict=None):
+    """
+
+    :param data:
+    :param unused:
+    :param out_path:
+    :param desc_dict: whether uses location descriptions. In this case the labels are the original detailed locations
+    :return:
+    """
     if desc_dict is not None:
         desc_dict["START"] = "The beginning of the testimony."
     texts = []
@@ -383,9 +394,9 @@ def _make_texts(data, unused, out_path, desc_dict=None):
                     texts.append(" [SEP] ".join([prev_loc[0], prev_text, prev_loc[1]]))
                 elif out_path[-1] == "3":  # deberta3
                     texts.append(" [SEP] ".join([prev_loc[0], prev_loc[1]]))
-                elif out_path[-1] == "4":  # deberta4
+                elif out_path[-1] == "4" or out_path[:6] == "distil":  # deberta4 or distilroberta
                     texts.append(" [SEP] ".join([prev_text, text]))
-                elif out_path[-1] == "5" and desc_dict is not None:
+                elif out_path[-1] == "5" and desc_dict is not None:  # from loc to loc with description
                     texts.append(" [SEP] ".join([prev_loc[0] + ": " + desc_dict[prev_loc[0]],
                                                  prev_loc[1] + ": " + desc_dict[prev_loc[1]]]))
                 else:
@@ -394,6 +405,8 @@ def _make_texts(data, unused, out_path, desc_dict=None):
                 # prev_text = " ".join(d[0].split()[-100:])
                 prev_text = text
                 prev_loc = [prev_loc[-1], d[1]]
+    if out_path[:6] == "distil":
+        labels = _add_loc_description(labels, desc_dict)
     return texts, labels
 
 
@@ -426,6 +439,7 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
     # with open(data_path + "locs_w_cat.json", 'r') as infile:
     with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
         data = json.load(infile)
+        _, all_labels = _make_texts(data, [], out_path)
         if test_size > 0:
             train_data = {t: text for t, text in list(data.items())[:int(first_train_size * len(data))]}
             val_data = {t: text for t, text in list(data.items())[-int(test_size * len(data))-int(val_size * len(data)):
@@ -449,7 +463,8 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
         train_texts, val_texts, train_labels, val_labels = train_test_split(texts, encoder.fit_transform(labels), test_size=.2, random_state=42)
     else:
         val_texts, val_labels = _make_texts(val_data, unused, out_path)
-        encoder.fit(labels + val_labels)
+        # encoder.fit(labels + val_labels)
+        encoder.fit(all_labels)
         val_labels = encoder.transform(val_labels)
         train_texts, train_labels = texts, encoder.transform(labels)
     print("made data")
@@ -462,6 +477,116 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
     train_encodings = tokenizer(train_texts, truncation=True, padding=True)
     val_encodings = tokenizer(val_texts, truncation=True, padding=True)
     print("made encodings")
+
+    train_dataset = Dataset(train_encodings, train_labels)
+    val_dataset = Dataset(val_encodings, val_labels)
+
+    if return_data:
+        return train_dataset, val_dataset
+
+    training_args = TrainingArguments(
+        output_dir='./results',          # output directory
+        num_train_epochs=5,              # total number of training epochs
+        learning_rate=5e-5,
+        per_device_train_batch_size=4,  # batch size per device during training
+        per_device_eval_batch_size=4,   # batch size for evaluation
+        gradient_accumulation_steps=2,
+        # learning_rate=5e-5,
+        # per_device_train_batch_size=16,  # batch size per device during training
+        # per_device_eval_batch_size=64,   # batch size for evaluation
+        warmup_steps=500,                # number of warmup steps for learning rate scheduler
+        weight_decay=0.01,               # strength of weight decay
+        logging_dir='./logs',            # directory for storing logs
+        logging_steps=10,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+    )
+
+    model = AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-base",
+                                                               cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
+                                                               num_labels=len(encoder.classes_))
+    model.to(dev)
+    print("Training")
+
+    trainer = Trainer(
+        model=model,                         # the instantiated 🤗 Transformers model to be trained
+        args=training_args,                  # training arguments, defined above
+        train_dataset=train_dataset,         # training dataset
+        eval_dataset=val_dataset,             # evaluation dataset
+        compute_metrics=compute_metrics,
+    )
+    trainer.train()
+    model.save_pretrained(out_path)
+
+    # if return_data:
+    return train_dataset, val_dataset
+
+
+def preprocess_examples(texts, tokenizer, full_labels):
+    first_sentences = [[text] * len(full_labels) for text in texts]
+    header = "The current location is: "
+    second_sentences = [f"{header}{fl}" for fl in full_labels]
+    # first_sentences = sum(first_sentences, [])
+    # second_sentences = sum(second_sentences, [])
+    tokenized_example = tokenizer(first_sentences, second_sentences, truncation=True)
+    # return {k: [v[i : i + 4] for i in range(0, len(v), 4)] for k, v in tokenized_example.items()}
+    return tokenized_example
+
+def train_multiple_choice(data_path, return_data=False, out_path=None, first_train_size=0.4, val_size=0.1, test_size=0.1,):
+    from sklearn.model_selection import train_test_split
+    from transformers import Trainer, TrainingArguments
+    from transformers import AutoModelForMultipleChoice, AutoTokenizer
+
+    from datasets import load_metric
+    from sklearn.preprocessing import LabelEncoder
+    import joblib
+
+    if torch.cuda.is_available():
+        dev = torch.device("cuda:0")
+        print("\n********* Training model on the GPU ***************")
+    else:
+        dev = torch.device("cpu")
+        print("\nTraining model on the CPU")
+
+    metric = load_metric("accuracy")
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        predictions = np.argmax(logits, axis=-1)
+        return metric.compute(predictions=predictions, references=labels)
+
+    # with open(data_path + "locs_w_cat.json", 'r') as infile:
+    with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
+        data = json.load(infile)
+        id2label = _make_texts(data, [], out_path)[1][1]
+        label2id = {l: i for i, l in enumerate(id2label)}
+        with open(out_path + '/label2id.json', 'w') as outfile:
+            json.dump(label2id, outfile)
+        train_data = {t: text for t, text in list(data.items())[:int(first_train_size * len(data))]}
+        val_data = {t: text for t, text in list(data.items())[-int(test_size * len(data))-int(val_size * len(data)):
+                                                              -int(test_size * len(data))]}
+        print(f"Training on {len(train_data)} documents")
+
+    with open(data_path + "sf_unused5.json", 'r') as infile:
+        unused = json.load(infile) + ['45064']
+
+
+    train_texts, (train_full_labels, train_labels) = _make_texts(train_data, unused, out_path)
+    train_labels = [label2id[l] for l in train_labels]
+    val_texts, (val_full_labels, val_labels) = _make_texts(val_data, unused, out_path)
+    val_labels = [label2id[l] for l in val_labels]
+    print("made data")
+    print(f"*************** {out_path.split('/')[-1]} **************")
+
+    tokenizer = AutoTokenizer.from_pretrained("distilroberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+
+    train_encodings = tokenizer(train_texts, truncation=True, padding=True)
+    val_encodings = tokenizer(val_texts, truncation=True, padding=True)
+    print("made encodings")
+
+    label_batch_size = 16
+
 
     train_dataset = Dataset(train_encodings, train_labels)
     val_dataset = Dataset(val_encodings, val_labels)
@@ -926,9 +1051,10 @@ if __name__ == "__main__":
     # prior = ''
     # prior = 'I1'
     # prior = 'const'
-    for prior in ["const", "I1", "I"]:
+    # for prior in ["const", "I1", "I"]:
+    for prior in ["I1"]:
         batch_size = 16
-        epochs = 1
+        epochs = 50
         name = f'/crf_{prior}_b{batch_size}_e{epochs}.pkl'
         print("********************* Using MINUS log-likelihood as loss *****************")
         print("Prior: " + prior)
@@ -939,13 +1065,13 @@ if __name__ == "__main__":
         # make_loc_data(data_path, use_segments=False, with_cat=True)
         # make_time_data(data_path)
         # for model_name in ["deberta3", "deberta", "deberta1", "deberta2"]:
-        # for model_name in ["deberta4"]:
-        for model_name in ["deberta1"]:
+        for model_name in ["deberta4"]:
+        # for model_name in ["deberta1"]:
             # for model_name in []:
             print(model_name)
             model_path = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/" + model_name
-            # train_dataset, val_dataset = train_classifier(data_path, return_data=False, out_path=model_path,
-            #                                               first_train_size=0.4, val_size=0.1, test_size=0.1)
+            train_dataset, val_dataset = train_classifier(data_path, return_data=False, out_path=model_path,
+                                                          first_train_size=0.4, val_size=0.1, test_size=0.1)
             # train_dataset, val_dataset = train_classifier(data_path, return_data=True, out_path=model_path)
 
             name = crf_decode(data_path, model_path, first_train_size=0.4, val_size=0.1, test_size=0.1, use_prior=prior, batch_size=batch_size, epochs=epochs)
