@@ -6,6 +6,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.metrics import f1_score
+import os
 
 import torch
 import tqdm
@@ -342,6 +343,30 @@ class Dataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.labels)
 
+class Dataset1(torch.utils.data.Dataset):
+    """
+    Dataset object
+    """
+    def __init__(self, data_path, labels):
+        # make sure the order is correct!!
+        self.data_files = os.listdir(data_path)
+        self.data_files = sorted(self.data_files)
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        # encoded_data = []
+        # for i in idx:
+        with open(self.data_files[i], 'r') as infile:
+            # encoded_data.append(json.load(infile))
+            item = json.load(infile)  # assumes one per batch
+        # return load_file(self.data_files[idx])
+        # item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor(self.labels[idx])
+        return item
+
+    def __len__(self):
+        return len(self.labels)
+
 
 def _add_loc_description(labels, desc_dict):
     return [l + ". " + desc_dict[l] for l in labels], labels
@@ -357,6 +382,7 @@ def _make_texts(data, unused, out_path, desc_dict=None):
     """
     if desc_dict is not None:
         desc_dict["START"] = "The beginning of the testimony."
+        desc_dict["END"] = "The end of the testimony."
     texts = []
     labels = []
     for t, t_data in data.items():
@@ -394,7 +420,7 @@ def _make_texts(data, unused, out_path, desc_dict=None):
                     texts.append(" [SEP] ".join([prev_loc[0], prev_text, prev_loc[1]]))
                 elif out_path[-1] == "3":  # deberta3
                     texts.append(" [SEP] ".join([prev_loc[0], prev_loc[1]]))
-                elif out_path[-1] == "4" or out_path[:6] == "distil":  # deberta4 or distilroberta
+                elif out_path[-1] == "4" or out_path.split("/")[-1][:6] == "distil":  # deberta4 or distilroberta
                     texts.append(" [SEP] ".join([prev_text, text]))
                 elif out_path[-1] == "5" and desc_dict is not None:  # from loc to loc with description
                     texts.append(" [SEP] ".join([prev_loc[0] + ": " + desc_dict[prev_loc[0]],
@@ -405,7 +431,7 @@ def _make_texts(data, unused, out_path, desc_dict=None):
                 # prev_text = " ".join(d[0].split()[-100:])
                 prev_text = text
                 prev_loc = [prev_loc[-1], d[1]]
-    if out_path[:6] == "distil":
+    if out_path.split("/")[-1][:6] == "distil":
         labels = _add_loc_description(labels, desc_dict)
     return texts, labels
 
@@ -436,9 +462,16 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
         predictions = np.argmax(logits, axis=-1)
         return metric.compute(predictions=predictions, references=labels)
 
+    with open(data_path + "sf_unused5.json", 'r') as infile:
+        unused = json.load(infile) + ['45064']
+    with open(data_path + "sf_five_locs.json", 'r') as infile:
+        unused = unused + json.load(infile)
     # with open(data_path + "locs_w_cat.json", 'r') as infile:
     with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
         data = json.load(infile)
+        for u in unused:
+            data.pop(u, None)
+
         _, all_labels = _make_texts(data, [], out_path)
         if test_size > 0:
             train_data = {t: text for t, text in list(data.items())[:int(first_train_size * len(data))]}
@@ -447,8 +480,7 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
             print(f"Training on {len(train_data)} documents")
         else:
             train_data = data
-    with open(data_path + "sf_unused5.json", 'r') as infile:
-        unused = json.load(infile) + ['45064']
+
 
     # locs = []
     texts, labels = _make_texts(train_data, unused, out_path)
@@ -523,15 +555,41 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
     return train_dataset, val_dataset
 
 
-def preprocess_examples(texts, tokenizer, full_labels):
-    first_sentences = [[text] * len(full_labels) for text in texts]
-    header = "The current location is: "
-    second_sentences = [f"{header}{fl}" for fl in full_labels]
-    # first_sentences = sum(first_sentences, [])
-    # second_sentences = sum(second_sentences, [])
-    tokenized_example = tokenizer(first_sentences, second_sentences, truncation=True)
-    # return {k: [v[i : i + 4] for i in range(0, len(v), 4)] for k, v in tokenized_example.items()}
-    return tokenized_example
+def preprocess_examples(texts, tokenizer, full_labels, data_path):
+    # Check that it can be done in one shot!
+    batch_size = 1
+    _batch = 0
+    encoded_data = {}
+    for j in range(0, len(texts), batch_size):
+        _batch += 1
+        try:
+            with open(data_path + f'/batch{_batch}.json', 'r') as infile:
+                encoded_data = json.load(infile)
+                continue
+        except IOError as err:
+            continue
+            pass
+
+        print("#batch: ", _batch)
+        sys.stdout.flush()
+
+        _texts = texts[j: j + batch_size]
+        first_sentences = [[text] * len(full_labels) for text in _texts]
+        header = "The current location is: "
+        second_sentences = [[f"{header}{fl}" for fl in full_labels] for _ in _texts]
+        first_sentences = sum(first_sentences, [])
+        second_sentences = sum(second_sentences, [])
+        tokenized_examples = tokenizer(first_sentences, second_sentences, truncation=True)
+        for k, v in tokenized_examples.items():
+            # encoded_data[k] = encoded_data.get(k, []) + [v[i: i + len(full_labels)] for i in range(0, len(v), len(full_labels))]
+            encoded_data[k] = [v[i: i + len(full_labels)] for i in range(0, len(v), len(full_labels))]
+        with open(data_path + f'/batch{_batch}.json', 'w') as outfile:
+            json.dump(encoded_data, outfile)
+
+
+    # return {k: [v[i: i + len(full_labels)] for i in range(0, len(v), len(full_labels))] for k, v in tokenized_examples.items()}
+    # return encoded_data
+
 
 def train_multiple_choice(data_path, return_data=False, out_path=None, first_train_size=0.4, val_size=0.1, test_size=0.1,):
     from sklearn.model_selection import train_test_split
@@ -541,6 +599,9 @@ def train_multiple_choice(data_path, return_data=False, out_path=None, first_tra
     from datasets import load_metric
     from sklearn.preprocessing import LabelEncoder
     import joblib
+
+    with open(data_path + 'loc_description_dict.json', 'r') as infile:
+        desc_dict = json.load(infile)
 
     if torch.cuda.is_available():
         dev = torch.device("cuda:0")
@@ -559,7 +620,7 @@ def train_multiple_choice(data_path, return_data=False, out_path=None, first_tra
     # with open(data_path + "locs_w_cat.json", 'r') as infile:
     with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
         data = json.load(infile)
-        id2label = _make_texts(data, [], out_path)[1][1]
+        id2label = _make_texts(data, [], out_path, desc_dict=desc_dict)[1][1]
         label2id = {l: i for i, l in enumerate(id2label)}
         with open(out_path + '/label2id.json', 'w') as outfile:
             json.dump(label2id, outfile)
@@ -567,29 +628,34 @@ def train_multiple_choice(data_path, return_data=False, out_path=None, first_tra
         val_data = {t: text for t, text in list(data.items())[-int(test_size * len(data))-int(val_size * len(data)):
                                                               -int(test_size * len(data))]}
         print(f"Training on {len(train_data)} documents")
+        sys.stdout.flush()
 
     with open(data_path + "sf_unused5.json", 'r') as infile:
         unused = json.load(infile) + ['45064']
 
 
-    train_texts, (train_full_labels, train_labels) = _make_texts(train_data, unused, out_path)
+    train_texts, (train_full_labels, train_labels) = _make_texts(train_data, unused, out_path, desc_dict=desc_dict)
     train_labels = [label2id[l] for l in train_labels]
-    val_texts, (val_full_labels, val_labels) = _make_texts(val_data, unused, out_path)
+    val_texts, (val_full_labels, val_labels) = _make_texts(val_data, unused, out_path, desc_dict=desc_dict)
     val_labels = [label2id[l] for l in val_labels]
     print("made data")
     print(f"*************** {out_path.split('/')[-1]} **************")
+    sys.stdout.flush()
 
     tokenizer = AutoTokenizer.from_pretrained("distilroberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
 
-    train_encodings = tokenizer(train_texts, truncation=True, padding=True)
-    val_encodings = tokenizer(val_texts, truncation=True, padding=True)
+    preprocess_examples(texts=train_texts, tokenizer=tokenizer, full_labels=train_full_labels, data_path=data_path + "/full_loc_train")
+    train_encodings = None
+    preprocess_examples(texts=val_texts, tokenizer=tokenizer, full_labels=val_full_labels, data_path=data_path + "/full_loc_val")
+    val_encodings = None
+    # train_encodings = tokenizer(train_texts, truncation=True, padding=True)
+    # val_encodings = tokenizer(val_texts, truncation=True, padding=True)
     print("made encodings")
+    sys.stdout.flush()
 
-    label_batch_size = 16
-
-
-    train_dataset = Dataset(train_encodings, train_labels)
-    val_dataset = Dataset(val_encodings, val_labels)
+    # label_batch_size = 16
+    train_dataset = Dataset1(data_path=data_path + "/full_loc_train", labels=train_labels)
+    val_dataset = Dataset1(data_path=data_path + "/full_loc_val", labels=val_labels)
 
     if return_data:
         return train_dataset, val_dataset
@@ -598,24 +664,23 @@ def train_multiple_choice(data_path, return_data=False, out_path=None, first_tra
         output_dir='./results',          # output directory
         num_train_epochs=5,              # total number of training epochs
         learning_rate=5e-5,
-        per_device_train_batch_size=4,  # batch size per device during training
-        per_device_eval_batch_size=4,   # batch size for evaluation
-        gradient_accumulation_steps=2,
+        per_device_train_batch_size=1,  # batch size per device during training
+        per_device_eval_batch_size=1,   # batch size for evaluation
+        gradient_accumulation_steps=8,
         # learning_rate=5e-5,
         # per_device_train_batch_size=16,  # batch size per device during training
         # per_device_eval_batch_size=64,   # batch size for evaluation
         warmup_steps=500,                # number of warmup steps for learning rate scheduler
         weight_decay=0.01,               # strength of weight decay
         logging_dir='./logs',            # directory for storing logs
-        logging_steps=10,
+        logging_steps=100,
         evaluation_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
     )
 
-    model = AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-base",
-                                                               cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
-                                                               num_labels=len(encoder.classes_))
+    model = AutoModelForMultipleChoice.from_pretrained("distilroberta-base",
+                                                               cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
     model.to(dev)
     print("Training")
 
@@ -952,8 +1017,17 @@ def decode(data_path, model_path, only_loc=False, only_text=False, val_size=0.1,
                                                                cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
                                                                num_labels=len(encoder.classes_)).to(dev)
 
+    with open(data_path + "sf_unused5.json", 'r') as infile:
+        unused = json.load(infile) + ['45064']
+    with open(data_path + "sf_five_locs.json", 'r') as infile:
+        unused = unused + json.load(infile)
     with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
         data = json.load(infile)
+        for u in unused:
+            data.pop(u, None)
+
+    # with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
+    #     data = json.load(infile)
 
     if test_size > 0:
         test_data = {t: text for t, text in list(data.items())[-int(test_size*len(data)) - int(val_size*len(data)):
@@ -999,8 +1073,16 @@ def crf_decode(data_path, model_path, first_train_size=0.4, val_size=0.1, test_s
     :param epochs:
     :return:
     """
+
+    with open(data_path + "sf_unused5.json", 'r') as infile:
+        unused = json.load(infile) + ['45064']
+    with open(data_path + "sf_five_locs.json", 'r') as infile:
+        unused = unused + json.load(infile)
     with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
         data = json.load(infile)
+        for u in unused:
+            data.pop(u, None)
+    print(f"With {len(data)} documents")
 
     if test_size > 0:
 
@@ -1022,6 +1104,7 @@ def crf_eval(data_path, model_path, val_size=0., test_size=0., name=''):
         data = json.load(infile)
     loc_crf = joblib.load(model_path + name)
 
+    return_dict = {}
     if test_size > 0:
         test_data = {t: text for t, text in list(data.items())[-int(test_size*len(data)) - int(val_size*len(data)):
                                                                -int(test_size*len(data))]}  # !!!!
@@ -1032,6 +1115,7 @@ def crf_eval(data_path, model_path, val_size=0., test_size=0., name=''):
             pred, labels = loc_crf.decode(test_data={t: t_data})
             # print(encoder.inverse_transform(pred[:10]))
             # print(labels[:10])
+            return_dict[t] = {"pred": encoder.inverse_transform(pred), "real": labels}
             ed, sm = _eval(pred, encoder.transform(labels))
             eds.append(ed/len(labels))
             sms.append(sm)
@@ -1040,6 +1124,7 @@ def crf_eval(data_path, model_path, val_size=0., test_size=0., name=''):
         wandb.log({'Edit': np.mean(eds), 'SM': np.mean(sms)})
     print("Done")
     sys.stdout.flush()
+    return return_dict
 
 
 if __name__ == "__main__":
@@ -1048,6 +1133,8 @@ if __name__ == "__main__":
 
     base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
     data_path = base_path + 'data/'
+    # make_description_category_dict(data_path)
+    first_train_size = 0.8
     # prior = ''
     # prior = 'I1'
     # prior = 'const'
@@ -1065,17 +1152,24 @@ if __name__ == "__main__":
         # make_loc_data(data_path, use_segments=False, with_cat=True)
         # make_time_data(data_path)
         # for model_name in ["deberta3", "deberta", "deberta1", "deberta2"]:
-        for model_name in ["deberta4"]:
-        # for model_name in ["deberta1"]:
+        # for model_name in ["deberta4"]:
+        # for model_name in ["distilroberta"]:
+        for model_name in ["deberta1"]:
+        # for model_name in ["deberta"]:
             # for model_name in []:
             print(model_name)
             model_path = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/" + model_name
-            train_dataset, val_dataset = train_classifier(data_path, return_data=False, out_path=model_path,
-                                                          first_train_size=0.4, val_size=0.1, test_size=0.1)
+            # train_dataset, val_dataset = train_classifier(data_path, return_data=False, out_path=model_path,
+            #                                               first_train_size=first_train_size, val_size=0.1, test_size=0.1)
+            # train_dataset, val_dataset = train_multiple_choice(data_path, return_data=False, out_path=model_path,
+            #                                                    first_train_size=first_train_size, val_size=0.1, test_size=0.1)
             # train_dataset, val_dataset = train_classifier(data_path, return_data=True, out_path=model_path)
 
-            name = crf_decode(data_path, model_path, first_train_size=0.4, val_size=0.1, test_size=0.1, use_prior=prior, batch_size=batch_size, epochs=epochs)
-            crf_eval(data_path, model_path, val_size=0.1, test_size=0.1, name=name)
+            # first_train_size=0 mean we retrain on all documents
+            name = crf_decode(data_path, model_path, first_train_size=0., val_size=0.1, test_size=0.1, use_prior=prior, batch_size=batch_size, epochs=epochs)
+            # name = "/crf_I1_b16_ee78.pkl"
+            d = crf_eval(data_path, model_path, val_size=0.1, test_size=0.1, name=name)
+
 
             # evaluate(model_path, val_dataset=val_dataset)
         #
@@ -1088,3 +1182,8 @@ if __name__ == "__main__":
     only_loc = model_name == "deberta3"
     only_text = model_name == "deberta1"
     decode(data_path, model_path, val_size=0.1, test_size=0.1, only_loc=only_loc, only_text=only_text)
+
+    for t, v in d.items():
+        print("\n" + t)
+        print("Preds:", np.array(v["pred"]))
+        print("True:", np.array(v["real"]))
