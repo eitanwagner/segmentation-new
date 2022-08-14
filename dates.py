@@ -6,13 +6,21 @@ import pandas as pd
 from sklearn.metrics import accuracy_score
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.metrics import f1_score
+from evaluation import edit_distance, gestalt_diff
+from sklearn.metrics import precision_recall_fscore_support
 import os
+import sys
+import wandb
 
 import torch
+from torch import nn
 import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import Trainer, TrainingArguments
+
 import joblib
 dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+dev2 = torch.device("cuda:1") if torch.cuda.device_count() > 1 else torch.device("cpu")
 
 # import enum
 # class Times(enum.Enum):
@@ -371,7 +379,7 @@ class Dataset1(torch.utils.data.Dataset):
 def _add_loc_description(labels, desc_dict):
     return [l + ". " + desc_dict[l] for l in labels], labels
 
-def _make_texts(data, unused, out_path, desc_dict=None):
+def _make_texts(data, unused, out_path, desc_dict=None, conversion_dict=None, vectors=None):
     """
 
     :param data:
@@ -380,6 +388,8 @@ def _make_texts(data, unused, out_path, desc_dict=None):
     :param desc_dict: whether uses location descriptions. In this case the labels are the original detailed locations
     :return:
     """
+    c_dict = conversion_dict if conversion_dict is not None else {}
+
     if desc_dict is not None:
         desc_dict["START"] = "The beginning of the testimony."
         desc_dict["END"] = "The end of the testimony."
@@ -408,9 +418,15 @@ def _make_texts(data, unused, out_path, desc_dict=None):
                 # texts.append(" [SEP] ".join([prev_loc[0], "", prev_loc[1], prev_text]))
             if i > 0:
                 if desc_dict is None:
-                    labels.append(d[2][0])
+                    if vectors is None:
+                        labels.append(c_dict.get(d[2][0], d[2][0]))
+                    else:
+                        if out_path[-1] == "6":
+                            labels.append(torch.cat([labels[-1], vectors[c_dict.get(d[2][0], d[2][0])]]))
+                        else:
+                            labels.append(vectors[c_dict.get(d[2][0], d[2][0])])
                 else:
-                    labels.append(d[1])
+                    labels.append(c_dict.get(d[1], d[1]))
                 # locs.append(prev_loc)
                 # texts.append((prev_text, prev_loc))
                 text = d[0]
@@ -425,18 +441,34 @@ def _make_texts(data, unused, out_path, desc_dict=None):
                 elif out_path[-1] == "5" and desc_dict is not None:  # from loc to loc with description
                     texts.append(" [SEP] ".join([prev_loc[0] + ": " + desc_dict[prev_loc[0]],
                                                  prev_loc[1] + ": " + desc_dict[prev_loc[1]]]))
+                elif out_path[-1] == "6" and desc_dict is not None:  # from prev to loc, with label
+                    if len(labels) < 2:
+                        texts.append(" [SEP] ".join([prev_text, "START"]))
+                    else:
+                        texts.append(" [SEP] ".join([prev_text, labels[-2]]))
                 else:
                     texts.append(" [SEP] ".join([prev_loc[0], prev_text, prev_loc[1], text]))
 
                 # prev_text = " ".join(d[0].split()[-100:])
                 prev_text = text
                 prev_loc = [prev_loc[-1], d[1]]
-    if out_path.split("/")[-1][:6] == "distil":
-        labels = _add_loc_description(labels, desc_dict)
+    # if out_path.split("/")[-1][:6] ==  "distil":
+    #     labels = _add_loc_description(labels, desc_dict)
     return texts, labels
 
 
-def train_classifier(data_path, return_data=False, out_path=None, first_train_size=0.4, val_size=0.1, test_size=0.1,):
+class MatrixTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.get('logits')  # of shape (batch_size, dim)?
+        out = logits.reshape(-1, logits.shape[-1] ** .5, logits.shape[-1] ** .5).log_softmax(dim=1) @ labels[:logits.shape[-1] ** .5]
+        loss_fct = nn.MSELoss()
+        loss = loss_fct(out.squeeze(), labels.squeeze())
+        return (loss, outputs) if return_outputs else loss
+
+def train_classifier(data_path, return_data=False, out_path=None, first_train_size=0.4, val_size=0.1, test_size=0.1,
+                     conversion_dict=None, vectors=None, matrix=False):
     from sklearn.model_selection import train_test_split
     from transformers import Trainer, TrainingArguments
     from transformers import DebertaV2Tokenizer, DebertaV2ForSequenceClassification
@@ -472,7 +504,8 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
         for u in unused:
             data.pop(u, None)
 
-        _, all_labels = _make_texts(data, [], out_path)
+        if vectors is None:
+            _, all_labels = _make_texts(data, [], out_path, conversion_dict=conversion_dict)
         if test_size > 0:
             train_data = {t: text for t, text in list(data.items())[:int(first_train_size * len(data))]}
             val_data = {t: text for t, text in list(data.items())[-int(test_size * len(data))-int(val_size * len(data)):
@@ -482,29 +515,25 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
             train_data = data
 
 
-    # locs = []
-    texts, labels = _make_texts(train_data, unused, out_path)
-        # labels.append("END")
-        # locs.append(prev_loc)
-        # texts.append(" [SEP] ".join([prev_loc[0], prev_text, prev_loc[1], text]))
-        # texts.append((prev_text, prev_loc))
+    train_texts, train_labels = _make_texts(train_data, unused, out_path, conversion_dict=conversion_dict, vectors=vectors)
 
     encoder = LabelEncoder()
 
-    if test_size == 0:
-        train_texts, val_texts, train_labels, val_labels = train_test_split(texts, encoder.fit_transform(labels), test_size=.2, random_state=42)
-    else:
-        val_texts, val_labels = _make_texts(val_data, unused, out_path)
-        # encoder.fit(labels + val_labels)
+
+    val_texts, val_labels = _make_texts(val_data, unused, out_path, conversion_dict=conversion_dict, vectors=vectors)
+    if vectors is None:
         encoder.fit(all_labels)
+        joblib.dump(encoder, out_path + '/label_encoder.pkl')
         val_labels = encoder.transform(val_labels)
-        train_texts, train_labels = texts, encoder.transform(labels)
+        train_labels = encoder.transform(train_labels)
+
     print("made data")
     print(f"*************** {out_path.split('/')[-1]} **************")
-    # out_path = '/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/deberta1'
-    joblib.dump(encoder, out_path + '/label_encoder.pkl')
 
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+    if out_path.split('/')[-1].find("distil") >= 0:
+        tokenizer = AutoTokenizer.from_pretrained("distilroberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+    else:
+        tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
 
     train_encodings = tokenizer(train_texts, truncation=True, padding=True)
     val_encodings = tokenizer(val_texts, truncation=True, padding=True)
@@ -516,6 +545,7 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
     if return_data:
         return train_dataset, val_dataset
 
+    p_type = "multi_label_classification" if vectors is None else "regression"
     training_args = TrainingArguments(
         output_dir='./results',          # output directory
         num_train_epochs=5,              # total number of training epochs
@@ -535,9 +565,15 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
         load_best_model_at_end=True,
     )
 
-    model = AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-base",
+    n_labels = len(encoder.classes_) if vectors is None else len(vectors[0])
+    if out_path.split('/')[-1].find("distil") >= 0:
+        model = AutoModelForSequenceClassification.from_pretrained("distilroberta-base",
                                                                cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
-                                                               num_labels=len(encoder.classes_))
+                                                               num_labels=n_labels)
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-base",
+                                                               cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
+                                                               num_labels=n_labels)
     model.to(dev)
     print("Training")
 
@@ -739,7 +775,7 @@ def evaluate(model_path, val_dataset):
 
 # **************** generate and evaluate ******************
 
-def greedy_decode(model, tokenizer, encoder, test_data, only_loc=False, only_text=False):
+def greedy_decode(model, tokenizer, encoder, test_data, only_loc=False, only_text=False, conversion_dict=None):
     """
 
     :param model:
@@ -747,28 +783,34 @@ def greedy_decode(model, tokenizer, encoder, test_data, only_loc=False, only_tex
     :param labels: real labels (for evaluation)
     :return:
     """
-    texts, labels = _make_texts(test_data, unused=[], out_path="1")  # only current text
+    texts, labels = _make_texts(test_data, unused=[], out_path="1", conversion_dict=conversion_dict)  # only current text
     model.eval()
-    output_sequence = []
-    prev_text = ""
-    _locs = ["START", "START"]
-    for text in texts:
-        if only_loc:
-            t = " [SEP] ".join([_locs[-2], _locs[-1]])
-        elif only_text:
-            t = text
-        else:
-            t = " [SEP] ".join([_locs[-2], prev_text, _locs[-1]] + [text])
-        encoding = tokenizer(t, truncation=True, padding=True)
-        # encoding = torch.split(torch.tensor(encoding['input_ids'], dtype=torch.long), 1)
-        encoding = torch.tensor(encoding['input_ids'], dtype=torch.long).to(dev)
-        prediction = model(encoding.unsqueeze(0))
-        output_sequence.append(int(np.argmax(prediction.logits[0].detach().cpu().numpy())))
-        _locs = [_locs[-1]] + list(encoder.inverse_transform(output_sequence[-1:]))
-        prev_text = text
+    ll = 0.
+    with torch.no_grad():
+        output_sequence = []
+        prev_text = ""
+        _locs = ["START", "START"]
+        for text in texts:
+            if only_loc:
+                t = " [SEP] ".join([_locs[-2], _locs[-1]])
+            elif only_text:
+                t = text
+            else:
+                t = " [SEP] ".join([_locs[-2], prev_text, _locs[-1]] + [text])
+            encoding = tokenizer(t, truncation=True, padding=True)
+            # encoding = torch.split(torch.tensor(encoding['input_ids'], dtype=torch.long), 1)
+            encoding = torch.tensor(encoding['input_ids'], dtype=torch.long).to(dev)
+            prediction = model(encoding.unsqueeze(0))
+            _probs = torch.log_softmax(prediction.logits[0].detach().cpu(), dim=-1).numpy()
+            # p = prediction.logits[0].detach().cpu().numpy()
+            output_sequence.append(int(np.argmax(_probs)))
+            ll += _probs[output_sequence[-1]]
+            _locs = [_locs[-1]] + list(encoder.inverse_transform(output_sequence[-1:]))
+            prev_text = text
+    print(f"Greedy likelihood score: {ll}")
     return output_sequence, encoder.transform(labels)
 
-def beam_decode(model, tokenizer, encoder, test_data, k=3, only_loc=False, only_text=False):
+def beam_decode(model, tokenizer, encoder, test_data, k=3, only_loc=False, only_text=False, conversion_dict=None):
     """
 
     :param model:
@@ -777,61 +819,74 @@ def beam_decode(model, tokenizer, encoder, test_data, k=3, only_loc=False, only_
     :return:
     """
     #fix!!!
-    texts, labels = _make_texts(test_data, unused=[], out_path="1")  # only current text
+    texts, labels = _make_texts(test_data, unused=[], out_path="1", conversion_dict=conversion_dict)  # only current text
     model.eval()
-    #start with an empty sequence with zero score
-    # output_sequences = [([], 0)]
-    output_sequences = [(["START", "START"], 0)]
+    with torch.no_grad():
+        #start with an empty sequence with zero score
+        # output_sequences = [([], 0)]
+        output_sequences = [(["START", "START"], 0)]
 
-    prev_text = ""
-    # _locs = ["START", "START"]
-    for text in texts:
-        new_sequences = []
+        prev_text = ""
+        # _locs = ["START", "START"]
+        for text in texts:
+            new_sequences = []
 
-        for old_seq, old_score in output_sequences:
-            if only_loc:
-                t = " [SEP] ".join([old_seq[-2], old_seq[-1]])
-            elif only_text:
-                t = text
-            else:
-                t = " [SEP] ".join([old_seq[-2], prev_text, old_seq[-1]] + [text])
-            encoding = tokenizer(t, truncation=True, padding=True)
-            # encoding = torch.split(torch.tensor(encoding['input_ids'], dtype=torch.long), 1)
-            encoding = torch.tensor(encoding['input_ids'], dtype=torch.long).to(dev)
-            prediction = model(encoding.unsqueeze(0))
-            _probs = torch.log_softmax(prediction.logits[0].detach().cpu(), dim=-1).numpy()
+            for old_seq, old_score in output_sequences:
+                if only_loc:
+                    t = " [SEP] ".join([old_seq[-2], old_seq[-1]])
+                elif only_text:
+                    t = text
+                else:
+                    t = " [SEP] ".join([old_seq[-2], prev_text, old_seq[-1]] + [text])
+                encoding = tokenizer(t, truncation=True, padding=True)
+                # encoding = torch.split(torch.tensor(encoding['input_ids'], dtype=torch.long), 1)
+                encoding = torch.tensor(encoding['input_ids'], dtype=torch.long).to(dev)
+                prediction = model(encoding.unsqueeze(0))
+                _probs = torch.log_softmax(prediction.logits[0].detach().cpu(), dim=-1).numpy()
 
-            for char_index in range(len(_probs)):
-                new_seq = old_seq + encoder.inverse_transform([char_index]).tolist()
-                #considering log-likelihood for scoring
-                new_score = old_score + _probs[char_index]
-                # new_score = old_score + np.log(_probs[char_index])
-                new_sequences.append((new_seq, new_score))
+                for char_index in range(len(_probs)):
+                    new_seq = old_seq + encoder.inverse_transform([char_index]).tolist()
+                    #considering log-likelihood for scoring
+                    new_score = old_score + _probs[char_index]
+                    # new_score = old_score + np.log(_probs[char_index])
+                    new_sequences.append((new_seq, new_score))
 
-        #sort all new sequences in the decreasing order of their score
-        output_sequences = sorted(new_sequences, key=lambda val: val[1], reverse=True)
-        #select top-k based on score
-        # *Note- best sequence is with the highest score
-        output_sequences = output_sequences[:k]
+            #sort all new sequences in the decreasing order of their score
+            output_sequences = sorted(new_sequences, key=lambda val: val[1], reverse=True)
+            #select top-k based on score
+            # *Note- best sequence is with the highest score
+            output_sequences = output_sequences[:k]
 
-        # _locs = [_locs[-1]] + list(encoder.inverse_transform(output_sequence[-1:]))
-        prev_text = text
+            # _locs = [_locs[-1]] + list(encoder.inverse_transform(output_sequence[-1:]))
+            prev_text = text
+    output_sequences = [(os[0][2:], os[1]) for os in output_sequences]
+    print(f"Top beam score: {output_sequences[0][1]}")
     return output_sequences, encoder.transform(labels)
 
 
 class LocCRF:
-    def __init__(self, model_path, use_prior=''):
+    def __init__(self, model_path, model_path2=None, use_prior='', conversion_dict=None):
         from TorchCRF import CRF
         self.model_path = model_path
+        self.model_path2 = model_path2
+        self.conversion_dict = conversion_dict
         self.encoder = joblib.load(model_path + "/label_encoder.pkl")
         self.tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+        # self.p_model = None
         self.model = AutoModelForSequenceClassification.from_pretrained(model_path,
                                                                         cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
                                                                         num_labels=len(self.encoder.classes_)).to(dev)
+        if model_path2 is not None:
+            self.model2 = AutoModelForSequenceClassification.from_pretrained(model_path,
+                                                                             cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
+                                                                             num_labels=len(self.encoder.classes_)).to(dev2)
 
         pad_idx = None
         const = None
         pad_idx_val = None
+        self.prior = use_prior
+        if model_path2 is not None:
+            self.prior = self.prior + "_trans"
         if use_prior == 'I':
             pad_idx = np.arange(len(self.encoder.classes_))
         if use_prior == 'I1':
@@ -840,33 +895,75 @@ class LocCRF:
         if use_prior == 'const':
             const = 0.1
         self.crf = CRF(len(self.encoder.classes_), pad_idx=pad_idx, pad_idx_val=pad_idx_val, const=const).to(dev)
-        self.prior = use_prior
+        with torch.no_grad():
+            self.crf.trans_matrix[:, self.encoder.transform(["START"])[0]] = -10000.
+            self.crf.trans_matrix[self.encoder.transform(["START"])[0], self.encoder.transform(["START"])[0]] = 0.
+
+
         # set self.crf.trans_matrix ?
         # self.crf.trans_matrix = nn.Parameter(torch.diag(torch.ones(len(self.encoder.classes_))))
         # set by pairwise distance??
 
 
     def _forward(self, texts):
+        """
+
+        :param texts: of shape (batch_size, num_segments)
+        :return:
+        """
         self.model.to(dev)
         # hidden = np.zeros((len(texts), max([len(t) for t in texts]), len(self.encoder.classes_)))
         hidden = torch.zeros(len(texts), max([len(t) for t in texts]), len(self.encoder.classes_)).to(dev)
+
+        if self.model_path2 is not None:
+            self.model2.to(dev2)
+            hidden2 = torch.zeros(len(texts), max([len(t) for t in texts]), len(self.encoder.classes_),
+                                  len(self.encoder.classes_)).to(dev2)
+
         if len(texts) == 0:
             return torch.from_numpy(hidden).to(dev)
-        for k, text in enumerate(texts):
+        for k, text in tqdm.tqdm(enumerate(texts), desc="Make encodings", leave=False):
+            # print("text")
+            # print(text)
             # encodings = [torch.tensor(self.tokenizer(t, truncation=True, padding=True)['input_ids'], dtype=torch.long).to(dev) for t in text]
             encodings = torch.tensor(self.tokenizer(text, truncation=True, padding=True)['input_ids'], dtype=torch.long).to(dev)
+
+            if self.model_path2 is not None:
+                cats = self.encoder.classes_
+                encodings2 = [torch.tensor(self.tokenizer([_text + " [SEP] " + c for _text in text], truncation=True,
+                                                          padding=True)['input_ids'], dtype=torch.long).to(dev2)
+                              for c in cats]
+                # print(encodings2[0])
             # print(encodings)
             # probs = [self.model(e.unsqueeze(0)).logits[0].detach().cpu().numpy() for e in encodings]
             # print([self.model(e.unsqueeze(0)).logits[0].detach() for e in encodings])
             # probs = np.array([self.model(e.unsqueeze(0).to(dev)).logits[0].detach().cpu().numpy() for e in encodings])
             for j, e in enumerate(encodings):
-                probs = self.model(e.unsqueeze(0).to(dev)).logits[0].detach()
+                # probs = self.model(e.unsqueeze(0).to(dev)).logits[0].detach()  #????
+                probs = self.model(e.unsqueeze(0).to(dev)).logits[0]  #????
                 hidden[k, j, :probs.shape[0]] = probs
+
+            if self.model_path2 is not None:
+                for _c, _encodings2 in enumerate(encodings2):  # category
+                    # probs2 = torch.zeros(len(self.encoder.classes_), len(self.encoder.classes_)).to(dev2)
+                    for j in range(0, len(_encodings2), 8):  # location in testimony
+                        probs2 = self.model2(_encodings2[j: j+8].to(dev2)).logits
+                        # print(probs2.shape)
+                        hidden2[k, j: j+probs2.shape[0], _c, :] = probs2
+
+                    # for j, e in enumerate(_encodings2):  # location in testimony
+                    #     probs2 = self.model2(e.unsqueeze(0).to(dev2)).logits[0]
+                        # hidden2[k, j, _c, :] = probs2
+
             # probs = self.model(encodings).logits.detach().cpu().numpy()
             # hidden[k, :probs.shape[0], :probs.shape[1]] = probs
         # self.model.cpu()
         # hidden = torch.from_numpy(hidden).to(dev)
-        hidden.requires_grad_()
+        # hidden.requires_grad_()
+        # if self.model_path2 is not None:
+        #     hidden2.requires_grad_()
+        if self.model_path2 is not None:
+            return hidden, hidden2
         return hidden
 
     def eval_loss(self, test_data=None):
@@ -874,43 +971,81 @@ class LocCRF:
         losses = []
         sys.stdout.flush()
         batch_size = 1
-        for i in tqdm.tqdm(range(len(_eval))):
-            # for t, t_data in tqdm.tqdm(list(train_data.items())[:int(len(train_data) * 0.9)]):
-            eval_batch = _eval[i: i+batch_size]
-            _batch_size = len(eval_batch)
+        self.model.eval()
+        if self.model_path2 is not None:
+            self.model2.eval()
+        with torch.no_grad():
+            for i in tqdm.tqdm(range(len(_eval)), desc="Eval loss"):
+                # for t, t_data in tqdm.tqdm(list(train_data.items())[:int(len(train_data) * 0.9)]):
+                eval_batch = _eval[i: i+batch_size]
+                _batch_size = len(eval_batch)
 
-            texts = []
-            label_mask = np.zeros((_batch_size, max([len(t) for t in eval_batch])), dtype=bool)
-            labels = np.zeros((_batch_size, max([len(t) for t in eval_batch])), dtype=int)
+                texts = []
+                label_mask = np.zeros((_batch_size, max([len(t) for t in eval_batch])), dtype=bool)
+                labels = np.zeros((_batch_size, max([len(t) for t in eval_batch])), dtype=int)
 
-            for j, _t in enumerate(eval_batch):
-                _texts, _labels = _make_texts({1: _t}, unused=[], out_path="1")  # only current text
-                label_mask[j, :len(_t)] = 1
-                labels[j, :len(_t)] = self.encoder.transform(_labels)
-                texts.append(_texts)
-                # labels.append(_labels)
+                for j, _t in enumerate(eval_batch):
+                    _texts, _labels = _make_texts({1: _t}, unused=[], out_path="1", conversion_dict=self.conversion_dict)  # only current text
+                    label_mask[j, :len(_t)] = 1
+                    labels[j, :len(_t)] = self.encoder.transform(_labels)
+                    texts.append(_texts)
+                    # labels.append(_labels)
 
-            hidden = self._forward(texts).detach()
+                # hidden = self._forward(texts).detach()
+                if self.model_path2 is not None:
+                    hidden, hidden2 = self._forward(texts)
+                    hidden2 = hidden2.to(dev)
+                else:
+                    hidden, hidden2 = self._forward(texts), None
 
-            mask = torch.from_numpy(label_mask).to(dev)
-            labels = torch.from_numpy(labels).to(dev)
+                mask = torch.from_numpy(label_mask).to(dev)
+                labels = torch.from_numpy(labels).to(dev)
 
-            self.crf.eval()
-            loss = -self.crf.forward(hidden, labels, mask).mean()
-            self.crf.train()
-            losses.append(loss.item())
-            # print(loss.item())
+                # self.crf.eval()
+                loss = -self.crf.forward(hidden, labels, mask, h2=hidden2).mean()
+                # self.crf.train()
+                losses.append(loss.item())
+                # print(loss.item())
         print("Eval loss:", np.mean(losses))
         wandb.log({'Eval loss': np.mean(losses)})
 
-    def train(self, train_data, batch_size=4, epochs=10, test_dict=None, test_data=None):
+    def train(self, train_data, batch_size=4, epochs=10, test_dict=None, test_data=None, accu_grad=1):
         print(f"Training. Batch size: {batch_size}, epochs: {epochs}")
+        print(f"Accu Grad: {accu_grad}")
         self.prior = self.prior + f"_b{batch_size}_e{epochs}"
         import random
         import torch.optim as optim
         # import torch.nn as nn
-        self.model.eval()  # don't train model
-        optimizer = optim.Adam(self.crf.parameters())
+        # self.model.eval()  # don't train model
+        # print("******************* leaving only layer 11.output unfrozen *******************")
+        # print("******************* leaving only layer 11 unfrozen!!!!!!!!! *******************")
+        print("******************* leaving all layer 5 unfrozen!!!!!!!!! *******************")
+        # print("******************* all layers frozen (including classifier) ******************")
+        # self.model.train()
+        self.model.train()
+        for name, param in self.model.named_parameters():
+            # if name.find("11.output") == -1 and name.find("11.intermediate") == -1 and name.find("classifier") == -1: # choose whatever you like here
+            # if name.find("11.output") == -1 and name.find("11.intermediate") == -1 and name.find("classifier") == -1:
+            if name.find("5") == -1 and name.find("classifier") == -1 and name.find("pooler") == -1:
+                # if name.find("classifier") == -1:  # choose whatever you like here
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+                # param.requires_grad = False
+        if self.model_path2 is not None:
+            self.model2.train()
+            for name, param in self.model2.named_parameters():
+                # if name.find("11.output") == -1 and name.find("classifier") == -1:
+                if name.find("classifier") == -1:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
+
+        # self.p_model = nn.DataParallel(model, device_ids=[0, 1, 2, 3])
+
+        optimizer = optim.Adam(list(self.crf.parameters()) + list(self.model.parameters()))
+        optimizer.zero_grad()
+
         # criterion = nn.CrossEntropyLoss()
         # self.crf = self.crf.to(dev)
         # criterion = criterion.to(dev)
@@ -921,15 +1056,22 @@ class LocCRF:
         # first eval
         print("With random transitions")
         name = self.save_model(epoch=0)
-        crf_eval(data_path=test_dict['data_path'], model_path=test_dict['model_path'],
-                 test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name)
+        if self.model_path2 is not None:
+            crf_eval(data_path=test_dict['data_path'], model_path=test_dict['model_path'], model_path2=test_dict['model_path2'],
+                     test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name)
+        else:
+            crf_eval(data_path=test_dict['data_path'], model_path=test_dict['model_path'],
+                     test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name)
 
         for e in range(epochs):
+            self.model.train()
+            if self.model_path2 is not None:
+                self.model2.train()
             losses = []
             print("\n" + str(e))
             sys.stdout.flush()
             random.shuffle(_train)
-            for i in tqdm.tqdm(range(0, len(_train), batch_size)):
+            for i in tqdm.tqdm(range(0, len(_train), batch_size), desc="Train"):
                 # for t, t_data in tqdm.tqdm(list(train_data.items())[:int(len(train_data) * 0.9)]):
                 train_batch = _train[i: i+batch_size]
                 _batch_size = len(train_batch)
@@ -939,14 +1081,17 @@ class LocCRF:
                 labels = np.zeros((_batch_size, max([len(t) for t in train_batch])), dtype=int)
 
                 for j, _t in enumerate(train_batch):
-                    _texts, _labels = _make_texts({1: _t}, unused=[], out_path=self.model_path)  # only current text
+                    _texts, _labels = _make_texts({1: _t}, unused=[], out_path=self.model_path, conversion_dict=self.conversion_dict)  # only current text
                     label_mask[j, :len(_t)] = 1
                     labels[j, :len(_t)] = self.encoder.transform(_labels)
                     texts.append(_texts)
                     # labels.append(_labels)
 
-                optimizer.zero_grad()
-                hidden = self._forward(texts)
+                if self.model_path2 is not None:
+                    hidden, hidden2 = self._forward(texts)
+                    hidden2 = hidden2.to(dev)
+                else:
+                    hidden, hidden2 = self._forward(texts), None
 
                 mask = torch.from_numpy(label_mask).to(dev)
                 # mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
@@ -954,10 +1099,13 @@ class LocCRF:
                 labels = torch.from_numpy(labels).to(dev)
                 # labels = torch.LongTensor(self.encoder.transform(labels)).unsqueeze(0).to(dev)  # (batch_size, sequence_size)
 
-                loss = -self.crf.forward(hidden, labels, mask).mean()
+                loss = -self.crf.forward(hidden, labels, mask, h2=hidden2).mean() / accu_grad
                 # loss = criterion(y_pred, label)
                 loss.backward()
-                optimizer.step()
+                if accu_grad == 1 or (i+1) % accu_grad == 0 or i+accu_grad >= len(_train) or _batch_size < batch_size:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
                 losses.append(loss.item())
                 wandb.log({'loss': loss})
                 # print(loss.item())
@@ -969,18 +1117,27 @@ class LocCRF:
                 name = self.save_model(epoch=e)
                 crf_eval(data_path=test_dict['data_path'], model_path=test_dict['model_path'],
                          test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name)
+
         return self
 
     def decode(self, test_data):
 
-        texts, labels = _make_texts(test_data, unused=[], out_path=self.model_path)  # only current text
-        self.model.eval()
+        texts, labels = _make_texts(test_data, unused=[], out_path=self.model_path, conversion_dict=self.conversion_dict)  # only current text
+        with torch.no_grad():
+            self.model.eval()
+            if self.model_path2 is None:
+                hidden, hidden2 = self._forward([texts]), None
+                # hidden = self._forward([texts])
+                hidden.detach()
+                mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
 
-        hidden = self._forward([texts])
-        hidden.detach()
-        mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
-
-        return self.crf.viterbi_decode(hidden, mask)[0], labels  # predictions and labels
+                return self.crf.viterbi_decode(hidden, mask, h2=hidden2)[0], labels  # predictions and labels
+            else:
+                self.model2.eval()
+                hidden, hidden2 = self._forward([texts])
+                hidden2.detach()
+                mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
+                return self.crf.viterbi_decode(hidden, mask, h2=hidden2.to(dev))[0], labels  # predictions and labels
 
     def save_model(self, epoch=None):
         if epoch is not None:
@@ -994,14 +1151,22 @@ class LocCRF:
 
 
 def _eval(pred, labels):
-    from evaluation import edit_distance, gestalt_diff
+
     ed, sm = edit_distance(pred, labels), gestalt_diff(pred, labels)
+    # print(len(pred), len(labels))
+    # print(pred)
+    # print(labels)
+    acc = accuracy_score(y_pred=pred, y_true=labels)
+    trans_pred = np.array(pred[:-1]) == np.array(pred[1:])
+    trans_labels = np.array(labels[:-1]) == np.array(labels[1:])
+    f1 = precision_recall_fscore_support(y_true=trans_labels, y_pred=trans_pred, average="binary")[2]
+
     # print("Edit distance: ", ed)
     # print("Sequence Matching: ", sm)
-    return ed, sm
+    return ed, sm, acc, f1
 
 
-def decode(data_path, model_path, only_loc=False, only_text=False, val_size=0.1, test_size=0.1):
+def decode(data_path, model_path, only_loc=False, only_text=False, val_size=0.1, test_size=0.1, c_dict=None):
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
     import joblib
 
@@ -1035,16 +1200,18 @@ def decode(data_path, model_path, only_loc=False, only_text=False, val_size=0.1,
     else:
         test_data = {t: text for t, text in list(data.items())[-5:]}  #!!!!
 
-    eds_g, sms_g = [], []
-    eds_b, sms_b = [], []
+    eds_g, sms_g, accs_g, f1s_g = [], [], [], []
+    eds_b, sms_b, accs_b, f1s_b = [], [], [], []
 
     for t, t_data in test_data.items():
-        pred, labels = greedy_decode(model, tokenizer, encoder, test_data={t: t_data}, only_loc=only_loc, only_text=only_text)
+        pred, labels = greedy_decode(model, tokenizer, encoder, test_data={t: t_data}, only_loc=only_loc,
+                                     only_text=only_text, conversion_dict=c_dict)
         # print(encoder.inverse_transform(pred[:10]))
         # print(encoder.inverse_transform(labels[:10]))
-        ed_g, sm_g = _eval(pred, labels)
-        preds, labels = beam_decode(model, tokenizer, encoder, test_data={t: t_data}, k=3, only_loc=only_loc, only_text=only_text)
-        ed_b, sm_b = _eval(encoder.transform(preds[0][0]), labels)
+        ed_g, sm_g, acc_g, f1_g = _eval(pred, labels)
+        preds, labels = beam_decode(model, tokenizer, encoder, test_data={t: t_data}, k=3, only_loc=only_loc,
+                                    only_text=only_text, conversion_dict=c_dict)
+        ed_b, sm_b, acc_b, f1_b = _eval(encoder.transform(preds[0][0]), labels)
         # print(preds[0][0][:10])
         # print(encoder.inverse_transform(labels[:10]))
 
@@ -1052,15 +1219,24 @@ def decode(data_path, model_path, only_loc=False, only_text=False, val_size=0.1,
         eds_b.append(ed_b / len(labels))
         sms_g.append(sm_g)
         sms_b.append(sm_b)
+        accs_g.append(acc_g)
+        accs_b.append(acc_b)
+        f1s_g.append(f1_g)
+        f1s_b.append(f1_b)
     print("Greedy")
     print("Edit: " + str(np.mean(eds_g)))
     print("SM: " + str(np.mean(sms_g)))
+    print("Accuracy: " + str(np.mean(accs_g)))
+    print("F1: " + str(np.mean(f1s_g)))
     print("Beam")
     print("Edit: " + str(np.mean(eds_b)))
     print("SM: " + str(np.mean(sms_b)))
+    print("Accuracy: " + str(np.mean(accs_b)))
+    print("F1: " + str(np.mean(f1s_b)))
     print("Done")
 
-def crf_decode(data_path, model_path, first_train_size=0.4, val_size=0.1, test_size=0.1, use_prior='', batch_size=4, epochs=10):
+def crf_decode(data_path, model_path, model_path2=None, first_train_size=0.4, val_size=0.1, test_size=0.1, use_prior='', batch_size=4,
+               epochs=10, conversion_dict=None):
     """
 
     :param data_path:
@@ -1091,13 +1267,16 @@ def crf_decode(data_path, model_path, first_train_size=0.4, val_size=0.1, test_s
         test_data = {t: text for t, text in list(data.items())[-int(test_size*len(data)) - int(val_size*len(data)):
                                                                -int(test_size*len(data))]}  #!!!!
         test_dict = {"data_path": data_path, "model_path": model_path, "test_size": test_size, "val_size": val_size}
+        if model_path2 is not None:
+            test_dict["model_path2"] = model_path2
     else:
         train_data = data
-    loc_crf = LocCRF(model_path, use_prior=use_prior).train(train_data, batch_size=batch_size, epochs=epochs,
-                                                            test_dict=test_dict, test_data=test_data)
+    loc_crf = LocCRF(model_path, model_path2=model_path2, use_prior=use_prior,
+                     conversion_dict=conversion_dict).train(train_data, batch_size=batch_size, epochs=epochs,
+                                                            test_dict=test_dict, test_data=test_data, accu_grad=1)
     return loc_crf.save_model()
 
-def crf_eval(data_path, model_path, val_size=0., test_size=0., name=''):
+def crf_eval(data_path, model_path, model_path2=None, val_size=0., test_size=0., name=''):
     print(f"Eval ({name})")
     encoder = joblib.load(model_path + "/label_encoder.pkl")
     with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
@@ -1109,27 +1288,29 @@ def crf_eval(data_path, model_path, val_size=0., test_size=0., name=''):
         test_data = {t: text for t, text in list(data.items())[-int(test_size*len(data)) - int(val_size*len(data)):
                                                                -int(test_size*len(data))]}  # !!!!
 
-        eds, sms = [], []
+        eds, sms, accs, f1s = [], [], [], []
         print("CRF")
-        for t, t_data in test_data.items():
+        for t, t_data in tqdm.tqdm(test_data.items(), desc="Eval"):
             pred, labels = loc_crf.decode(test_data={t: t_data})
             # print(encoder.inverse_transform(pred[:10]))
             # print(labels[:10])
             return_dict[t] = {"pred": encoder.inverse_transform(pred), "real": labels}
-            ed, sm = _eval(pred, encoder.transform(labels))
+            ed, sm, acc, f1 = _eval(pred, encoder.transform(labels))
             eds.append(ed/len(labels))
             sms.append(sm)
+            accs.append(acc)
+            f1s.append(f1)
         print("Edit: " + str(np.mean(eds)))
         print("SM: " + str(np.mean(sms)))
-        wandb.log({'Edit': np.mean(eds), 'SM': np.mean(sms)})
+        print("Accuracy: " + str(np.mean(accs)))
+        print("F1: " + str(np.mean(f1s)))
+        wandb.log({'Edit': np.mean(eds), 'SM': np.mean(sms), 'Accuracy': np.mean(accs), 'F1': np.mean(f1s)})
     print("Done")
     sys.stdout.flush()
     return return_dict
 
 
-if __name__ == "__main__":
-    import sys
-    import wandb
+def main():
 
     base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
     data_path = base_path + 'data/'
@@ -1139,51 +1320,72 @@ if __name__ == "__main__":
     # prior = 'I1'
     # prior = 'const'
     # for prior in ["const", "I1", "I"]:
+    model_name2 = None
+    # model_name2 = "deberta6"
+    # model_name2 = "distilroberta6"
+    model_path2 = None
+    c_dict = None
     for prior in ["I1"]:
-        batch_size = 16
+        batch_size = 1
         epochs = 50
         name = f'/crf_{prior}_b{batch_size}_e{epochs}.pkl'
         print("********************* Using MINUS log-likelihood as loss *****************")
+        # print("********************* Using conversion dict *****************")
+        from loc_clusters import make_loc_conversion
+        c_dict = make_loc_conversion(data_path=data_path)
         print("Prior: " + prior)
-        wandb.init(project="location tracking", config={"prior": prior, "batch_size": batch_size, "epochs": epochs})
 
         # make_loc_data(data_path, use_segments=True, with_cat=True, with_country=True)
         # make_loc_data(data_path, use_segments=False, with_cat=True, with_country=True)
         # make_loc_data(data_path, use_segments=False, with_cat=True)
         # make_time_data(data_path)
-        # for model_name in ["deberta3", "deberta", "deberta1", "deberta2"]:
-        # for model_name in ["deberta4"]:
-        # for model_name in ["distilroberta"]:
-        for model_name in ["deberta1"]:
+        # for model_name in ["distilroberta1", "distilroberta6", "deberta"]:
+        for model_name in ["distilroberta1"]:
+        # for model_name in []:
         # for model_name in ["deberta"]:
+            wandb.init(project="location tracking", config={"prior": prior, "batch_size": batch_size, "epochs": epochs,
+                                                            "model_name": model_name})
+            # for model_name in ["deberta4"]:
+            # for model_name in ["deberta6"]:
+            # for model_name in ["deberta11"]:
+            # for model_name in ["deberta"]:
             # for model_name in []:
             print(model_name)
             model_path = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/" + model_name
+            if model_name2 is not None:
+                print(model_name2)
+                model_path2 = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/" + model_name2
             # train_dataset, val_dataset = train_classifier(data_path, return_data=False, out_path=model_path,
-            #                                               first_train_size=first_train_size, val_size=0.1, test_size=0.1)
+            #                                               first_train_size=first_train_size, val_size=0.1, test_size=0.1,
+            #                                               conversion_dict=c_dict)
             # train_dataset, val_dataset = train_multiple_choice(data_path, return_data=False, out_path=model_path,
             #                                                    first_train_size=first_train_size, val_size=0.1, test_size=0.1)
             # train_dataset, val_dataset = train_classifier(data_path, return_data=True, out_path=model_path)
 
             # first_train_size=0 mean we retrain on all documents
-            name = crf_decode(data_path, model_path, first_train_size=0., val_size=0.1, test_size=0.1, use_prior=prior, batch_size=batch_size, epochs=epochs)
-            # name = "/crf_I1_b16_ee78.pkl"
+            name = crf_decode(data_path, model_path, model_path2, first_train_size=0., val_size=0.1, test_size=0.1, use_prior=prior,
+                              batch_size=batch_size, epochs=epochs, conversion_dict=c_dict)
+            # # name = "/crf_I1_b16_ee78.pkl"
             d = crf_eval(data_path, model_path, val_size=0.1, test_size=0.1, name=name)
-
+            #
 
             # evaluate(model_path, val_dataset=val_dataset)
         #
     model_name = "deberta"
-    # model_name = "deberta1"
+    # # model_name = "deberta1"
     print("Greedy and Beam ")
     print(model_name)
     model_path = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/" + model_name
     # only_loc, only_text = False, False
     only_loc = model_name == "deberta3"
     only_text = model_name == "deberta1"
-    decode(data_path, model_path, val_size=0.1, test_size=0.1, only_loc=only_loc, only_text=only_text)
+    decode(data_path, model_path, val_size=0.1, test_size=0.1, only_loc=only_loc, only_text=only_text, c_dict=c_dict)
 
     for t, v in d.items():
         print("\n" + t)
         print("Preds:", np.array(v["pred"]))
         print("True:", np.array(v["real"]))
+
+
+if __name__ == "__main__":
+    main()
