@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import json
 import tqdm
+import sys
 
 def T5_joint():
     from transformers import T5Tokenizer, T5ForConditionalGeneration
@@ -55,9 +56,9 @@ def _T5_mask_filling(model=None, tokenizer=None, w1="dog", w2="black"):
     w2_ids = tokenizer(w2).input_ids[:-1]
     # black_id = tokenizer(w2).input_ids[0]
     # print(probs[1, dog_id] + probs[3, black_id])
-    scores = {"indepndent": probs[np.arange(1, 1+len(w1_ids)), w1_ids].sum() + probs[np.arange(3, 3+len(w2_ids)), w2_ids].sum(),
-              "w1 first": probs[np.arange(1, 1+len(w1_ids)), w1_ids].sum() + probs2[np.arange(1, 1+len(w2_ids)), w2_ids].sum(),
-              "w2 first": probs[np.arange(3, 3+len(w2_ids)), w2_ids].sum() + probs3[np.arange(1, 1+len(w1_ids)), w1_ids].sum()}
+    scores = {"independent": float(probs[np.arange(1, 1+len(w1_ids)), w1_ids].sum(dtype=float) + probs[np.arange(3, 3+len(w2_ids)), w2_ids].sum(dtype=float)),
+              "w1 first": float(probs[np.arange(1, 1+len(w1_ids)), w1_ids].sum(dtype=float) + probs2[np.arange(1, 1+len(w2_ids)), w2_ids].sum(dtype=float)),
+              "w2 first": float(probs[np.arange(3, 3+len(w2_ids)), w2_ids].sum(dtype=float) + probs3[np.arange(1, 1+len(w1_ids)), w1_ids].sum(dtype=float))}
     # print(probs[np.arange(1, 1+len(w1_ids)), w1_ids].sum() + probs[np.arange(3, 3+len(w2_ids)), w2_ids].sum())
     # print(probs[1, dog_id] + probs2[1, black_id])
     # print(probs[np.arange(1, 1+len(w1_ids)), w1_ids].sum() + probs2[np.arange(1, 1+len(w2_ids)), w2_ids].sum())
@@ -72,13 +73,15 @@ def _T5_mask_filling(model=None, tokenizer=None, w1="dog", w2="black"):
     # print(loss.item())
     return scores
 
-def T5_mask_filling():
+def T5_mask_filling(noun_count=100, adj_count=50):
     from nltk.corpus import wordnet as wn
     all_nouns = list(set([word for synset in wn.all_synsets('n') for word in synset.lemma_names()
-                          if (word.find("_") == -1 and len(word) >= 2)]))
+                          if (word.find("_") == -1 and len(word) >= 3)]))
     all_adjs = list(set([word for synset in wn.all_synsets('a') for word in synset.lemma_names()
-                         if (word.find("_") == -1 and len(word) >= 2)]))
+                         if (word.find("_") == -1 and len(word) >= 3)]))
 
+    print("all nouns: ", len(all_nouns))
+    print("all adjs: ", len(all_adjs))
     # from wordfreq import top_n_list
     # top_n_list('en', 100, wordlist=all_nouns)
     freq_dict = make_freq()
@@ -88,20 +91,20 @@ def T5_mask_filling():
     tokenizer = T5Tokenizer.from_pretrained("t5-small")
     model = T5ForConditionalGeneration.from_pretrained("t5-small")
     # w1, w2 = "dog", "black"
-    noun_count = 1000
-    adj_count = 100
+    # noun_count = 100
+    # adj_count = 50
     all_scores = {}
     print("noun_count", noun_count)
     print("adj_count", adj_count)
     for w1 in tqdm.tqdm(all_nouns[:noun_count]):
         for w2 in all_adjs[:adj_count]:
             scores = _T5_mask_filling(model=model, tokenizer=tokenizer, w1=w1, w2=w2)
-            print(w1, w2)
-            print(scores)
-            all_scores[f"w1,w2"] = scores
+            # print(w1, w2)
+            # print(scores)
+            all_scores[f"{w1},{w2}"] = scores
     with open(f'/cs/snapless/oabend/eitan.wagner/segmentation/all_scores_{noun_count}_{adj_count}.json', 'w') as outfile:
         json.dump(all_scores, outfile)
-    return
+    return noun_count, adj_count
 
 def make_freq():
     # from: https://github.com/hermitdave/FrequencyWords/blob/master/content/2018/en/en_full.txt
@@ -109,6 +112,22 @@ def make_freq():
         lines = infile.readlines()
     freq_dict = {l.split()[0]: int(l.split()[1]) for l in lines}
     return freq_dict
+
+def divergence(noun_count, adj_count):
+    with open(f'/cs/snapless/oabend/eitan.wagner/segmentation/all_scores_{noun_count}_{adj_count}.json', 'r') as infile:
+        all_scores = json.load(infile)
+
+    p1, p2 = [], []
+    for t, s in all_scores.items():
+        p1.append(s["w1 first"])
+        p2.append(s["w2 first"])
+
+    from scipy.spatial import distance
+    p1, p2 = np.exp(p1), np.exp(p2)
+    d = distance.jensenshannon(p1 / p1.sum(), p2 / p2.sum(), 2.)
+    print("Jensen-Shannon: ")
+    print(d)
+    return d
 
 def mask_filling():
     import torch
@@ -213,7 +232,20 @@ def main():
     # mask_filling()
     # causal_lm()
     # T5_joint()
-    T5_mask_filling()
+    noun_count, adj_count = T5_mask_filling(noun_count=100, adj_count=50)
+    noun_count, adj_count = 100, 50
+    print(noun_count, adj_count)
+    divergence(noun_count, adj_count)
+
+    noun_count, adj_count = 1000, 500
+    print(noun_count, adj_count)
+    divergence(noun_count, adj_count)
+    sys.stdout.flush()
+
+    noun_count, adj_count = T5_mask_filling(noun_count=10000, adj_count=500)
+    # noun_count, adj_count = 1000, 100
+    print(noun_count, adj_count)
+    divergence(noun_count, adj_count)
     # T5_mask_filling(w1="encyclopedia", w2="exclusive")
     print("Done")
 
