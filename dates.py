@@ -469,7 +469,9 @@ def _make_texts(data, unused, out_path, desc_dict=None, conversion_dict=None, ve
             label_vectors = [np.concatenate([l_v, label_vectors[i]]) for i, l_v in enumerate([v_dict["START"]] +
                                                                                         label_vectors[:-1])]
             # label_vectors = [torch.cat([l_v, label_vectors[i]]) for i, l_v in enumerate([v_dict["START"]] +
-            #                                                                             label_vectors[:-1])]
+        #                                                                             label_vectors[:-1])]
+        #     return texts[:-1], label_vectors[1:]
+            return texts, label_vectors
         return texts, label_vectors
     return texts, labels
 
@@ -655,8 +657,9 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
 
     )
 
-    p_type = "multi_label_classification" if vectors is None else \
-        "regression" if not matrix else None
+    # p_type = "multi_label_classification" if vectors is None else \
+    #     "regression" if not matrix else None
+    p_type = "multi_label_classification" if vectors is None else "regression"
     n_labels = len(encoder.classes_) if vectors is None else \
         len(vectors[1][0]) if not matrix else len(vectors[1][0]) ** 2
     if out_path.split('/')[-1].find("distil") >= 0:
@@ -982,7 +985,7 @@ def beam_decode(model, tokenizer, encoder, test_data, k=3, only_loc=False, only_
 
 
 class LocCRF:
-    def __init__(self, model_path, model_path2=None, use_prior='', conversion_dict=None, vectors=None):
+    def __init__(self, model_path, model_path2=None, use_prior='', conversion_dict=None, vectors=None, theta=None):
         from TorchCRF import CRF
         self.model_path = model_path
         self.model_path2 = model_path2
@@ -991,10 +994,13 @@ class LocCRF:
         if vectors is None:
             self.encoder = joblib.load(model_path + "/label_encoder.pkl")
             self.classes = self.encoder.classes_
-            self.start_id = self.classes.index("START")
+            self.start_id = self.encoder.transform(["START"])[0]
+
         else:
             self.classes = vectors[0]
-            self.start_id = self.encoder.transform(["START"])[0]
+            self.start_id = self.classes.index("START")
+            from loc_clusters import SBertEncoder
+            self.encoder = SBertEncoder(vectors=vectors)
 
         distilroberta = model_path.split('/')[-1].find("distil") >= 0
         if distilroberta:
@@ -1005,13 +1011,16 @@ class LocCRF:
                                                       cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
 
         # self.p_model = None
+        n_labels = len(self.classes) if vectors is None else len(vectors[1][0])
+        n_labels2 = len(self.classes) if vectors is None else len(vectors[1][0]) ** 2
+        p_type = "multi_label_classification" if vectors is None else "regression"
         self.model = AutoModelForSequenceClassification.from_pretrained(model_path,
                                                                         cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
-                                                                        num_labels=len(self.encoder.classes_)).to(dev)
+                                                                        num_labels=n_labels, problem_type=p_type).to(dev)
         if model_path2 is not None:
-            self.model2 = AutoModelForSequenceClassification.from_pretrained(model_path,
+            self.model2 = AutoModelForSequenceClassification.from_pretrained(model_path2,
                                                                              cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
-                                                                             num_labels=len(self.encoder.classes_)).to(dev2)
+                                                                             num_labels=n_labels2, problem_type=p_type).to(dev2)
 
         pad_idx = None
         const = None
@@ -1026,7 +1035,7 @@ class LocCRF:
             pad_idx_val = -1.
         if use_prior == 'const':
             const = 0.1
-        self.crf = CRF(len(self.classes), pad_idx=pad_idx, pad_idx_val=pad_idx_val, const=const).to(dev)
+        self.crf = CRF(len(self.classes), pad_idx=pad_idx, pad_idx_val=pad_idx_val, const=const, theta=theta).to(dev)
         with torch.no_grad():
             self.crf.trans_matrix[:, self.start_id] = -10000.
             self.crf.trans_matrix[self.start_id, self.start_id] = 0.
@@ -1044,20 +1053,18 @@ class LocCRF:
         :return:
         """
         self.model.to(dev)
-        # hidden = np.zeros((len(texts), max([len(t) for t in texts]), len(self.encoder.classes_)))
+        # shape (batch_size, seq_len, num_classes)
         hidden = torch.zeros(len(texts), max([len(t) for t in texts]), len(self.classes)).to(dev)
 
         if self.model_path2 is not None:
             self.model2.to(dev2)
+            # shape (batch_size, seq_len, num_classes, num_classes)
             hidden2 = torch.zeros(len(texts), max([len(t) for t in texts]), len(self.classes),
                                   len(self.classes)).to(dev2)
 
         if len(texts) == 0:
             return torch.from_numpy(hidden).to(dev)
         for k, text in tqdm.tqdm(enumerate(texts), desc="Make encodings", leave=False):
-            # print("text")
-            # print(text)
-            # encodings = [torch.tensor(self.tokenizer(t, truncation=True, padding=True)['input_ids'], dtype=torch.long).to(dev) for t in text]
             encodings = torch.tensor(self.tokenizer(text, truncation=True, padding=True)['input_ids'], dtype=torch.long).to(dev)
 
             if self.model_path2 is not None and self.vectors is None:
@@ -1075,18 +1082,20 @@ class LocCRF:
                 if self.vectors is None:
                     probs = self.model(e.unsqueeze(0).to(dev)).logits[0]  #????
                 else:
-                    outputs = model(**encodings)
-                    logits = outputs.get('logits')  # of shape (batch_size, vec_dim)?
+                    outputs = self.model(e.unsqueeze(0).to(dev))
+                    logits = outputs.get('logits').squeeze(0)  # of shape (batch_size, vec_dim)?
                     # should be of shape (batch_size, num_labels)
-                    probs = util.cos_sim(logits, self.vectors).softmax(dim=-1)
+                    # probs = util.cos_sim(logits, torch.from_numpy(self.vectors[1]).to(logits.device)).log_softmax(dim=-1).squeeze(0)
+                    probs = util.cos_sim(logits, torch.from_numpy(self.vectors[1]).to(logits.device)).squeeze(0)
 
-                    outputs2 = model2(**encodings)
-                    logits2 = outputs2.get('logits')  # of shape (batch_size, vec_dim**2)?
+                    outputs2 = self.model2(e.unsqueeze(0).to(dev2))
+                    logits2 = outputs2.get('logits').squeeze(0)  # of shape (batch_size, vec_dim**2)?
 
                     # here we work with a single input
-                    out2 = logits.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ self.vectors.T
-                    # sims should be a tensor of shape (num_classes)
-                    probs2 = util.cos_sim(self.vectors, out2).softmax(dim=1)
+                    out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ torch.from_numpy(self.vectors[1]).to(logits2.device).T
+                    # probs2 should be a tensor of shape (num_classes, num_classes)
+                    # probs2 = util.cos_sim(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device)).log_softmax(dim=1)
+                    probs2 = util.cos_sim(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
                     hidden2[k, j, :, :] = probs2
 
                 hidden[k, j, :probs.shape[0]] = probs
@@ -1193,10 +1202,10 @@ class LocCRF:
         # self.p_model = nn.DataParallel(model, device_ids=[0, 1, 2, 3])
 
         if self.model_path2 is None:
-            optimizer = optim.Adam(list(self.crf.parameters()) + list(self.model.parameters()))
+            optimizer = optim.AdamW(list(self.crf.parameters()) + list(self.model.parameters()))
         else:
-            optimizer = optim.Adam(list(self.crf.parameters()) + list(self.model.parameters()) +
-                                   list(self.model2.parameters()))
+            optimizer = optim.AdamW(list(self.crf.parameters()) + list(self.model.parameters()) +
+                                   list(self.model2.parameters()), lr=5e-5)
         optimizer.zero_grad()
 
         # criterion = nn.CrossEntropyLoss()
@@ -1208,13 +1217,13 @@ class LocCRF:
 
         # first eval
         print("With random transitions")
-        name = self.save_model(epoch=0)
+        name = self.save_model(epoch=epochs)  # TODO:
         if self.model_path2 is not None:
             crf_eval(data_path=test_dict['data_path'], model_path=test_dict['model_path'], model_path2=test_dict['model_path2'],
-                     test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name)
+                     test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name, vectors=self.vectors)
         else:
             crf_eval(data_path=test_dict['data_path'], model_path=test_dict['model_path'],
-                     test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name)
+                     test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name, vectors=self.vectors)
 
         for e in range(epochs):
             self.model.train()
@@ -1263,13 +1272,14 @@ class LocCRF:
                 wandb.log({'loss': loss})
                 # print(loss.item())
             print("Epoch loss:", np.mean(losses))
+            print("Theta: ", self.crf.theta.item())
             wandb.log({'Epoch loss': np.mean(losses)})
             if test_data is not None:
                 self.eval_loss(test_data)
             if e % 3 == 0:
-                name = self.save_model(epoch=e)
+                name = self.save_model(epoch=epochs)  # TODO:
                 crf_eval(data_path=test_dict['data_path'], model_path=test_dict['model_path'],
-                         test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name)
+                         test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name, vectors=self.vectors)
 
         return self
 
@@ -1288,8 +1298,8 @@ class LocCRF:
             else:
                 self.model2.eval()
                 hidden, hidden2 = self._forward([texts])
-                hidden2.detach()
-                mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
+                # hidden2.detach()
+                mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size, sequence_size)
                 return self.crf.viterbi_decode(hidden, mask, h2=hidden2.to(dev))[0], labels  # predictions and labels
 
     def save_model(self, epoch=None):
@@ -1389,7 +1399,7 @@ def decode(data_path, model_path, only_loc=False, only_text=False, val_size=0.1,
     print("Done")
 
 def crf_decode(data_path, model_path, model_path2=None, first_train_size=0.4, val_size=0.1, test_size=0.1, use_prior='', batch_size=4,
-               epochs=10, conversion_dict=None, accu_grad=1):
+               epochs=10, conversion_dict=None, accu_grad=1, vectors=None, theta=None):
     """
 
     :param data_path:
@@ -1425,13 +1435,17 @@ def crf_decode(data_path, model_path, model_path2=None, first_train_size=0.4, va
     else:
         train_data = data
     loc_crf = LocCRF(model_path, model_path2=model_path2, use_prior=use_prior,
-                     conversion_dict=conversion_dict).train(train_data, batch_size=batch_size, epochs=epochs,
+                     conversion_dict=conversion_dict, vectors=vectors, theta=theta).train(train_data, batch_size=batch_size, epochs=epochs,
                                                             test_dict=test_dict, test_data=test_data, accu_grad=accu_grad)
     return loc_crf.save_model()
 
-def crf_eval(data_path, model_path, model_path2=None, val_size=0., test_size=0., name=''):
+def crf_eval(data_path, model_path, model_path2=None, val_size=0., test_size=0., name='', vectors=None):
     print(f"Eval ({name})")
-    encoder = joblib.load(model_path + "/label_encoder.pkl")
+    if vectors is None:
+        encoder = joblib.load(model_path + "/label_encoder.pkl")
+    else:
+        from loc_clusters import SBertEncoder
+        encoder = SBertEncoder(vectors=vectors)
     with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
         data = json.load(infile)
     loc_crf = joblib.load(model_path + name)
@@ -1475,16 +1489,19 @@ def main():
     # for prior in ["const", "I1", "I"]:
     model_name2 = None
     # model_name2 = "deberta6"
-    # model_name2 = "distilroberta6"
+    model_name2 = "v_distilroberta6"
     model_path2 = None
     c_dict = None
     use_vectors = 'v'
+    vectors = None
     for prior in ["I1"]:
         batch_size = 1
-        accu_grad = 4
+        accu_grad = 1
         epochs = 50
+        # theta = None
+        theta = .5
+        print("theta:" , theta)
         name = f'/crf_{prior}_b{batch_size}_a{accu_grad}_e{epochs}_{use_vectors}.pkl'
-        print("********************* Using MINUS log-likelihood as loss *****************")
         # print("********************* Using conversion dict *****************")
         from loc_clusters import make_loc_conversion
         c_dict = make_loc_conversion(data_path=data_path)
@@ -1497,8 +1514,8 @@ def main():
         # make_loc_data(data_path, use_segments=False, with_cat=True, with_country=True)
         # make_loc_data(data_path, use_segments=False, with_cat=True)
         # make_time_data(data_path)
-        for model_name in ["distilroberta6"]:
-        # for model_name in ["distilroberta1"]:
+        # for model_name in ["distilroberta6"]:
+        for model_name in ["distilroberta1"]:
         # for model_name in []:
         # for model_name in ["deberta"]:
             wandb.init(project="location tracking", config={"prior": prior, "batch_size": batch_size, "epochs": epochs,
@@ -1511,24 +1528,25 @@ def main():
             if use_vectors != "":
                 model_name = "v_" + model_name
             print(model_name)
+            sys.stdout.flush()
             model_path = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/" + model_name
             if model_name2 is not None:
                 print(model_name2)
                 model_path2 = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/" + model_name2
 
-            train_dataset, val_dataset = train_classifier(data_path, return_data=False, out_path=model_path,
-                                                          first_train_size=first_train_size, val_size=0.1, test_size=0.1,
-                                                          conversion_dict=c_dict, vectors=vectors,
-                                                          matrix=model_name[-1] == "6")
+            # train_dataset, val_dataset = train_classifier(data_path, return_data=False, out_path=model_path2,
+            #                                               first_train_size=first_train_size, val_size=0.1, test_size=0.1,
+            #                                               conversion_dict=c_dict, vectors=vectors,
+            #                                               matrix=model_name2[-1] == "6")
             # train_dataset, val_dataset = train_multiple_choice(data_path, return_data=False, out_path=model_path,
             #                                                    first_train_size=first_train_size, val_size=0.1, test_size=0.1)
             # train_dataset, val_dataset = train_classifier(data_path, return_data=True, out_path=model_path)
 
             # first_train_size=0 mean we retrain on all documents
-            # name = crf_decode(data_path, model_path, model_path2, first_train_size=0., val_size=0.1, test_size=0.1, use_prior=prior,
-            #                   batch_size=batch_size, epochs=epochs, conversion_dict=c_dict, accu_grad=accu_grad)
+            name = crf_decode(data_path, model_path, model_path2, first_train_size=0., val_size=0.1, test_size=0.1, use_prior=prior,
+                              batch_size=batch_size, epochs=epochs, conversion_dict=c_dict, accu_grad=accu_grad, vectors=vectors, theta=theta)
             # name = "/crf_I1_b16_ee78.pkl"
-            # d = crf_eval(data_path, model_path, val_size=0.1, test_size=0.1, name=name)
+            d = crf_eval(data_path, model_path, val_size=0.1, test_size=0.1, name=name)
             #
 
             # evaluate(model_path, val_dataset=val_dataset)
@@ -1543,10 +1561,10 @@ def main():
     # only_text = model_name == "deberta1"
     # decode(data_path, model_path, val_size=0.1, test_size=0.1, only_loc=only_loc, only_text=only_text, c_dict=c_dict)
     #
-    # for t, v in d.items():
-    #     print("\n" + t)
-    #     print("Preds:", np.array(v["pred"]))
-    #     print("True:", np.array(v["real"]))
+    for t, v in d.items():
+        print("\n" + t)
+        print("Preds:", np.array(v["pred"]))
+        print("True:", np.array(v["real"]))
 
 
 if __name__ == "__main__":
