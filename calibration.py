@@ -76,7 +76,7 @@ def _T5_mask_filling(model=None, tokenizer=None, w1=None, w2=None, batch_size=1)
                    for i in range(batch_size)]),
                   # float(probs[np.arange(1, 1+len(w1_ids)), w1_ids].sum(dtype=float) + probs2[np.arange(1, 1+len(w2_ids)), w2_ids].sum(dtype=float)),
               "w2 first":
-                  np.array([float(probs[i, np.arange(2+len(w1_ids[i]), 2+len(w1_ids[i])+len(w2_ids[i])), w1_ids[i]].sum(dtype=float)
+                  np.array([float(probs[i, np.arange(2+len(w1_ids[i]), 2+len(w1_ids[i])+len(w2_ids[i])), w2_ids[i]].sum(dtype=float)
                          + probs3[i, np.arange(1, 1+len(w1_ids[i])), w1_ids[i]].sum(dtype=float))
                    for i in range(batch_size)]),
                   # float(probs[np.arange(3, 3+len(w2_ids)), w2_ids].sum(dtype=float) + probs3[np.arange(1, 1+len(w1_ids)), w1_ids].sum(dtype=float))}
@@ -96,37 +96,51 @@ def _T5_mask_filling(model=None, tokenizer=None, w1=None, w2=None, batch_size=1)
     return scores
 
 def T5_mask_filling(noun_count=100, adj_count=50, batch_size=1):
-    # from nltk.corpus import wordnet as wn
-    # all_nouns = list(set([word for synset in wn.all_synsets('n') for word in synset.lemma_names()
-    #                       if (word.find("_") == -1 and len(word) >= 3)]))
-    # all_adjs = list(set([word for synset in wn.all_synsets('a') for word in synset.lemma_names()
-    #                      if (word.find("_") == -1 and len(word) >= 3)]))
+    from nltk.corpus import wordnet as wn
+    all_nouns = list(set([word for synset in wn.all_synsets('n') for word in synset.lemma_names()
+                          if (word.find("_") == -1 and len(word) >= 3)]))
+    all_adjs = list(set([word for synset in wn.all_synsets('a') for word in synset.lemma_names()
+                         if (word.find("_") == -1 and len(word) >= 3)]))
 
-    # print("all nouns: ", len(all_nouns))
-    # print("all adjs: ", len(all_adjs))
-    # # from wordfreq import top_n_list
-    # # top_n_list('en', 100, wordlist=all_nouns)
-    # freq_dict = make_freq()
-    # all_nouns.sort(key=lambda w: freq_dict.get(w, 0), reverse=True)
-    # all_adjs.sort(key=lambda w: freq_dict.get(w, 0), reverse=True)
-    # with open(f'/cs/snapless/oabend/eitan.wagner/calibration/sorted_noun_list.json', 'w') as outfile:
-    #     json.dump(all_nouns, outfile)
-    # with open(f'/cs/snapless/oabend/eitan.wagner/calibration/sorted_adj_list.json', 'w') as outfile:
-    #     json.dump(all_adjs, outfile)
-    with open(f'/cs/snapless/oabend/eitan.wagner/calibration/sorted_noun_list.json', 'w') as f:
+    print("all nouns: ", len(all_nouns))
+    print("all adjs: ", len(all_adjs))
+    all_nouns = all_nouns[:len(all_nouns)//4]
+    all_adjs = all_adjs[:len(all_adjs)//4]
+    print("all nouns: ", len(all_nouns))
+    print("all adjs: ", len(all_adjs))
+
+    freq_dict = make_freq()
+    all_nouns.sort(key=lambda w: freq_dict.get(w, 0), reverse=True)
+    all_adjs.sort(key=lambda w: freq_dict.get(w, 0), reverse=True)
+    with open(f'/cs/snapless/oabend/eitan.wagner/calibration/sorted_noun_list.json', 'w') as outfile:
+        json.dump(all_nouns, outfile)
+    with open(f'/cs/snapless/oabend/eitan.wagner/calibration/sorted_adj_list.json', 'w') as outfile:
+        json.dump(all_adjs, outfile)
+
+    with open(f'/cs/snapless/oabend/eitan.wagner/calibration/sorted_noun_list.json', 'r') as f:
         all_nouns = json.load(f)
-    with open(f'/cs/snapless/oabend/eitan.wagner/calibration/sorted_adj_list.json', 'w') as f:
+    with open(f'/cs/snapless/oabend/eitan.wagner/calibration/sorted_adj_list.json', 'r') as f:
         all_adjs = json.load(f)
 
-    all_nouns = all_nouns
-    all_adjs = all_adjs
+
     if noun_count is None:
         noun_count = len(all_nouns)
     if adj_count is None:
         adj_count = len(all_nouns)
-    all_scores_w1 = np.zeros((len(all_nouns), len(all_adjs)))
-    all_scores_w2 = np.zeros((len(all_nouns), len(all_adjs)))
-    all_scores_i = np.zeros((len(all_nouns), len(all_adjs)))
+    # all_scores_w1 = np.zeros((len(all_nouns), len(all_adjs)))
+    with open(f'/cs/snapless/oabend/eitan.wagner/calibration/all_scores_w1.npy', 'rb') as f:
+        all_scores_w1 = np.load(f)
+    # all_scores_w2 = np.zeros((len(all_nouns), len(all_adjs)))
+    with open(f'/cs/snapless/oabend/eitan.wagner/calibration/all_scores_w2.npy', 'rb') as f:
+        all_scores_w2 = np.load(f)
+    # all_scores_i = np.zeros((len(all_nouns), len(all_adjs)))
+    with open(f'/cs/snapless/oabend/eitan.wagner/calibration/all_scores_i.npy', 'rb') as f:
+        all_scores_i = np.load(f)
+
+    # calculated_nouns = []
+    calculated_nouns = list(set(all_nouns[:2380]))
+
+
     with torch.no_grad():
         tokenizer = T5Tokenizer.from_pretrained("t5-small")
         model = T5ForConditionalGeneration.from_pretrained("t5-small")
@@ -137,8 +151,9 @@ def T5_mask_filling(noun_count=100, adj_count=50, batch_size=1):
         print("batch_size", batch_size)
         print("noun_count", noun_count)
         print("adj_count", adj_count)
-        calculated_nouns = []
         for i, w1 in tqdm.tqdm(enumerate(all_nouns[:noun_count])):
+            if w1 in calculated_nouns:
+                continue
             # for j, w2 in enumerate(all_adjs[:adj_count]):
             for j in range(0, len(all_adjs[:adj_count]), batch_size):
                 w2 = all_adjs[j: j+batch_size]
@@ -146,11 +161,12 @@ def T5_mask_filling(noun_count=100, adj_count=50, batch_size=1):
                 all_scores_w1[i,j:j+batch_size] = scores["w1 first"]
                 all_scores_w2[i,j:j+batch_size] = scores["w2 first"]
                 all_scores_i[i,j:j+batch_size] = scores["independent"]
+            calculated_nouns = calculated_nouns + [w1]
                 # print(w1, w2)
                 # print(scores)
                 # all_scores[f"{w1},{w2}"] = scores
 
-            if i % 10 == 0:
+            if i % 50 == 0:
                 with open(f'/cs/snapless/oabend/eitan.wagner/calibration/all_scores_w1.npy', 'wb') as f:
                     np.save(f, all_scores_w1)
                 with open(f'/cs/snapless/oabend/eitan.wagner/calibration/all_scores_w2.npy', 'wb') as f:

@@ -5,6 +5,7 @@ import numpy as np
 from sklearn.cluster import AffinityPropagation
 import json
 import torch
+from torch import nn
 from sklearn.preprocessing import LabelEncoder
 import joblib
 from tqdm import tqdm
@@ -47,6 +48,7 @@ def make_vectors(data_path, cat=False, conversion_dict=None):
     # vector_dict = {loc: model.encode(v) for loc, v in desc_dict.items()}
     # embeddings = model.encode(sentences)
 
+
 def find_closest(locs=None, vectors=None, c_vector=None, tensor=False):
     sims = util.cos_sim(vectors, c_vector)
     # return locs[np.argmax(sims)]
@@ -55,10 +57,39 @@ def find_closest(locs=None, vectors=None, c_vector=None, tensor=False):
     return int(np.argmax(sims))
 
 
-class SBertEncoder:
-    def __init__(self, vectors):
-        self.classes_ = vectors[0]
-        self.vectors = vectors[1]
+class SBertEncoder(nn.Module):
+    def __init__(self, vectors=None, data_path=None, cat=False, conversion_dict=None):
+        super().__init__()
+        if vectors is not None:
+            self.classes_ = vectors[0]
+            self.vectors = vectors[1]
+        else:
+            self.model = SentenceTransformer('all-MiniLM-L6-v2')
+            if data_path is None:
+                base_path = '/cs/snapless/oabend/eitan.wagner/segmentation/'
+                data_path = base_path + 'data/'
+            with open(data_path + 'loc_description_dict.json', 'r') as infile:
+                desc_dict = json.load(infile)
+                desc_dict["START"] = "The beginning of the testimony."
+                desc_dict["END"] = "The end of the testimony."
+                self.desc_dict = desc_dict
+            if cat:
+                with open(data_path + 'loc_category_dict.json', 'r') as infile:
+                    cat_dict = json.load(infile)
+                    cat_dict["START"] = "START"
+                    cat_dict["END"] = "END"
+                cat_list = {conversion_dict.get(c): [] for c in set(cat_dict.values())}
+                for l, c in cat_dict.items():
+                    cat_list[conversion_dict.get(c)].append(l)
+                self.cat_list = cat_list
+                dict = {}
+                for c, l in cat_list.items():
+                    # embeddings = model.encode([_l + desc_dict.get(_l, "") for _l in l], convert_to_tensor=True)
+                    embeddings = self.model.encode([_l + desc_dict.get(_l, "") for _l in l], convert_to_tensor=True)
+                    dict[c] = embeddings.mean(dim=0)
+                self.classes_, self.vectors = list(dict.keys()), torch.stack(list(dict.values()), dim=0)
+                self.vectors.requires_grad = True
+
         # self.vector_dict = {c: v for c, v in zip(vectors)}
 
     def inverse_transform(self, v_labels):
