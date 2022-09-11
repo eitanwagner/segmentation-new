@@ -138,7 +138,8 @@ def T5_mask_filling(noun_count=100, adj_count=50, batch_size=1):
         all_scores_i = np.load(f)
 
     # calculated_nouns = []
-    calculated_nouns = list(set(all_nouns[:2380]))
+    calculated_nouns = list(set(all_nouns[:3500]))
+    # did we miss those between 2350 and 2380??
 
 
     with torch.no_grad():
