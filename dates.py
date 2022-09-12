@@ -24,7 +24,7 @@ from loc_clusters import find_closest
 import joblib
 dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 dev2 = torch.device("cuda:1") if torch.cuda.device_count() > 1 else torch.device("cpu")
-dev3 = torch.device("cuda:2") if torch.cuda.device_count() > 2 else torch.device("cpu")
+dev3 = torch.device("cuda:2") if torch.cuda.device_count() > 2 else torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
 # import enum
 # class Times(enum.Enum):
@@ -1123,7 +1123,7 @@ class LocCRF:
             pad_idx_val = -1.
         if use_prior == 'const':
             const = 0.1
-        self.crf = CRF(len(self.classes), pad_idx=pad_idx, pad_idx_val=pad_idx_val, const=const, theta=theta).to(dev)
+        self.crf = CRF(len(self.classes), pad_idx=pad_idx, pad_idx_val=pad_idx_val, const=const, theta=theta).to(dev3)
         with torch.no_grad():
             self.crf.trans_matrix[:, self.start_id] = -10000.
             self.crf.trans_matrix[self.start_id, self.start_id] = 0.
@@ -1148,8 +1148,13 @@ class LocCRF:
         if self.model_path2 is not None:
             self.model2.to(dev2)
             # shape (batch_size, seq_len, num_classes, num_classes)
-            hidden2 = torch.zeros(len(texts), max([len(t) for t in texts]), len(self.classes),
-                                  len(self.classes)).to(dev2)
+            seq_len = max([len(t) for t in texts])
+            hidden2 = torch.zeros(len(texts), seq_len, len(self.classes),
+                                  len(self.classes)).to(dev3)
+            # hidden2_2 = torch.zeros(len(texts), seq_len - seq_len//2, len(self.classes),
+            #                       len(self.classes)).to(dev3)
+            # hidden2 = torch.zeros(len(texts), max([len(t) for t in texts]), len(self.classes),
+            #                       len(self.classes)).to("cpu")
 
         if len(texts) == 0:
             return torch.from_numpy(hidden).to(dev)
@@ -1198,7 +1203,8 @@ class LocCRF:
                                     probs = util.cos_sim(logits, torch.from_numpy(self.vectors[1]).to(logits.device)).squeeze(0)
 
                     outputs2 = self.model2(e.unsqueeze(0).to(dev2))
-                    logits2 = outputs2.get('logits').squeeze(0)  # of shape (batch_size, vec_dim**2)?
+                    # logits2 = outputs2.get('logits').squeeze(0)  # of shape (batch_size, vec_dim**2)?
+                    logits2 = outputs2.get('logits').squeeze(0).to(dev3)  # of shape (batch_size, vec_dim**2)?
 
                     # here we work with a single input
                     if self.w_scales:
@@ -1212,12 +1218,14 @@ class LocCRF:
                             probs2 = (out2 * weights2 @ torch.from_numpy(self.vectors[1]).to(logits2.device).T).squeeze(0)
                     else:
                         if self.train_vectors:
+                            # out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ self.vectors[1].to(logits2.device).T
                             out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ self.vectors[1].to(logits2.device).T
                             if self.v_scales:
                                 probs2 = util.dot_score(out2.T, self.vectors[1].to(logits2.device))
                             else:
                                 probs2 = util.cos_sim(out2.T, self.vectors[1].to(logits2.device))
                             hidden2[k, j, :, :] = probs2
+                            # hidden2[k, j, :, :] = probs2.to(dev3)
                         else:
                             out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ torch.from_numpy(self.vectors[1]).to(logits2.device).T
                             if self.v_scales:
@@ -1283,15 +1291,18 @@ class LocCRF:
                 # hidden = self._forward(texts).detach()
                 if self.model_path2 is not None:
                     hidden, hidden2 = self._forward(texts)
-                    hidden2 = hidden2.to(dev)
+                    # hidden2 = hidden2.to(dev)
+                    hidden2 = hidden2.to(dev3)
                 else:
                     hidden, hidden2 = self._forward(texts), None
 
-                mask = torch.from_numpy(label_mask).to(dev)
-                labels = torch.from_numpy(labels).to(dev)
+                # mask = torch.from_numpy(label_mask).to(dev)
+                mask = torch.from_numpy(label_mask).to(dev3)
+                # labels = torch.from_numpy(labels).to(dev)
+                labels = torch.from_numpy(labels).to(dev3)
 
                 # self.crf.eval()
-                loss = -self.crf.forward(hidden, labels, mask, h2=hidden2).mean()
+                loss = -self.crf.forward(hidden.to(dev3), labels, mask, h2=hidden2).mean()
                 # self.crf.train()
                 losses.append(loss.item())
                 # print(loss.item())
@@ -1388,17 +1399,19 @@ class LocCRF:
                 if self.model_path2 is not None:
                     # with torch.no_grad():
                         hidden, hidden2 = self._forward(texts)
-                        hidden2 = hidden2.to(dev)
+                        # hidden2 = hidden2.to(dev)
+                        hidden2 = hidden2.to(dev3)
                 else:
                     hidden, hidden2 = self._forward(texts), None
 
-                mask = torch.from_numpy(label_mask).to(dev)
+                # mask = torch.from_numpy(label_mask).to(dev)
+                mask = torch.from_numpy(label_mask).to(dev3)
                 # mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
-                # print(label)
-                labels = torch.from_numpy(labels).to(dev)
+                # labels = torch.from_numpy(labels).to(dev)
+                labels = torch.from_numpy(labels).to(dev3)
                 # labels = torch.LongTensor(self.encoder.transform(labels)).unsqueeze(0).to(dev)  # (batch_size, sequence_size)
 
-                loss = -self.crf.forward(hidden, labels, mask, h2=hidden2).mean() / accu_grad
+                loss = -self.crf.forward(hidden.to(dev3), labels, mask, h2=hidden2).mean() / accu_grad
                 # loss = criterion(y_pred, label)
                 loss.backward()
                 if accu_grad == 1 or (i+1) % accu_grad == 0 or i+accu_grad >= len(_train) or _batch_size < batch_size:
@@ -1430,15 +1443,17 @@ class LocCRF:
                 hidden, hidden2 = self._forward([texts]), None
                 # hidden = self._forward([texts])
                 # hidden.detach()
-                mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
+                # mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
+                mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev3)  # (batch_size. sequence_size)
 
-                return self.crf.viterbi_decode(hidden, mask, h2=hidden2)[0], labels  # predictions and labels
+                return self.crf.viterbi_decode(hidden.to(dev3), mask, h2=hidden2)[0], labels  # predictions and labels
             else:
                 self.model2.eval()
                 hidden, hidden2 = self._forward([texts])
                 # hidden2.detach()
-                mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size, sequence_size)
-                return self.crf.viterbi_decode(hidden, mask, h2=hidden2.to(dev))[0], labels  # predictions and labels
+                # mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size, sequence_size)
+                mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev3)  # (batch_size, sequence_size)
+                return self.crf.viterbi_decode(hidden.to(dev3), mask, h2=hidden2.to(dev3))[0], labels  # predictions and labels
 
     def save_model(self, epoch=None):
         if epoch is not None:
@@ -1491,9 +1506,6 @@ def decode(data_path, model_path, only_loc=False, only_text=False, val_size=0.1,
         data = json.load(infile)
         for u in unused:
             data.pop(u, None)
-
-    # with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
-    #     data = json.load(infile)
 
     if test_size > 0:
         test_data = {t: text for t, text in list(data.items())[-int(test_size*len(data)) - int(val_size*len(data)):
@@ -1587,8 +1599,15 @@ def crf_eval(data_path, model_path, model_path2=None, val_size=0., test_size=0.,
     else:
         from loc_clusters import SBertEncoder
         encoder = SBertEncoder(vectors=vectors)
+
+    with open(data_path + "sf_unused5.json", 'r') as infile:
+        unused = json.load(infile) + ['45064']
+    with open(data_path + "sf_five_locs.json", 'r') as infile:
+        unused = unused + json.load(infile)
     with open(data_path + "locs_segments_w_cat.json", 'r') as infile:
         data = json.load(infile)
+        for u in unused:
+            data.pop(u, None)
     loc_crf = joblib.load(model_path + name)
 
     return_dict = {}
@@ -1639,6 +1658,7 @@ def main():
     model_path2 = None
     c_dict = None
     use_vectors = 'v'
+    # use_vectors = ''
     vectors = None
     if "-m" in sys.argv:
         _model_name = sys.argv[sys.argv.index("-m") + 1]
