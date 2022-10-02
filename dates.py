@@ -25,6 +25,15 @@ import joblib
 dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 dev2 = torch.device("cuda:1") if torch.cuda.device_count() > 1 else torch.device("cpu")
 dev3 = torch.device("cuda:2") if torch.cuda.device_count() > 2 else torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+dev4 = torch.device("cuda:3") if torch.cuda.device_count() > 3 else torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+dev5 = torch.device("cuda:4") if torch.cuda.device_count() > 4 else torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+dev6 = torch.device("cuda:5") if torch.cuda.device_count() > 5 else torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+# dev7 = torch.device("cuda:6") if torch.cuda.device_count() > 6 else torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+
+NUM_BINS = 10
+SOFTMAX = True
+print(f"num bins: {NUM_BINS}")
+print(f"SOFTMAX: {SOFTMAX}")
 
 # import enum
 # class Times(enum.Enum):
@@ -383,7 +392,22 @@ class Dataset1(torch.utils.data.Dataset):
 def _add_loc_description(labels, desc_dict):
     return [l + ". " + desc_dict[l] for l in labels], labels
 
-def _make_texts(data, unused, out_path, desc_dict=None, conversion_dict=None, vectors=None):
+
+def _add_locs(data, sep_token='[SEP]'):
+    import spacy
+    spacy.require_gpu()
+    nlp = spacy.load("/cs/snapless/oabend/eitan.wagner/segmentation/ner/model-best")
+
+    for t, d in tqdm.tqdm(data.items()):
+        for _d in d:
+            doc = nlp(_d[0])
+            _d[0] = f" {sep_token} ".join([doc.text] + [e.text + " " + e.label_ for e in doc.ents])
+    return data
+
+    # doc = nlp(text)
+    # return f" {sep_token} ".join([text] + [e.text + " " + e.label_ for e in doc.ents])
+
+def _make_texts(data, unused, out_path, desc_dict=None, conversion_dict=None, vectors=None, ners=False, sep_token=" ", use_bins=False, matrix=False):
     """
 
     :param data:
@@ -393,6 +417,15 @@ def _make_texts(data, unused, out_path, desc_dict=None, conversion_dict=None, ve
     :return:
     """
     c_dict = conversion_dict if conversion_dict is not None else {}
+
+    # if ners:
+    #     import spacy
+    #     nlp = spacy.load("/cs/snapless/oabend/eitan.wagner/segmentation/ner/model-best")
+
+    if out_path.split("/")[-1].find("deberta") >= 0:
+        sep_token = '[SEP]'
+    else:
+        sep_token = '</s>'
 
     if out_path.find("v_all") >= 0:
         desc_dict = {}
@@ -435,10 +468,19 @@ def _make_texts(data, unused, out_path, desc_dict=None, conversion_dict=None, ve
                     #     else:
                     #         labels.append(v_dict[c_dict.get(d[2][0], d[2][0])])
                 else:
-                    labels.append(c_dict.get(d[1], d[1]))
+                    # labels.append(c_dict.get(d[1], d[1]))
+                    labels.append(d[1])
                 # locs.append(prev_loc)
                 # texts.append((prev_text, prev_loc))
                 text = d[0]
+                if use_bins:
+                    text = str((NUM_BINS * i) // len(t_data)) + sep_token + " " + text
+                # if ners:
+                #     if out_path.split("/")[-1][:6] == "deberta":
+                #         sep_token = '[SEP]'
+                #     else:
+                #         sep_token = '</s>'
+                #     text = _add_locs(nlp, text, sep_token)
                 if out_path[-1] == "1":  # deberta1
                     texts.append(" [SEP] ".join([text]))
                 elif out_path[-1] == "2":  # deberta2
@@ -450,13 +492,15 @@ def _make_texts(data, unused, out_path, desc_dict=None, conversion_dict=None, ve
                 elif out_path[-1] == "5" and desc_dict is not None:  # from loc to loc with description
                     texts.append(" [SEP] ".join([prev_loc[0] + ": " + desc_dict[prev_loc[0]],
                                                  prev_loc[1] + ": " + desc_dict[prev_loc[1]]]))
-                elif out_path[-1] == "6" and desc_dict is not None:  # from prev to loc, with label
-                    if len(labels) < 2:
-                        texts.append(" [SEP] ".join([prev_text, "START"]))
-                    else:
-                        texts.append(" [SEP] ".join([prev_text, labels[-2]]))
-                elif out_path[-1] == "6" and vectors is not None:
-                    texts.append(" [SEP] ".join([prev_text]))
+                elif out_path[-1] == "6":
+                    if vectors is not None or matrix:
+                        texts.append(" [SEP] ".join([prev_text]))
+                    elif desc_dict is not None:  # from prev to loc, with label
+                        if len(labels) < 2:
+                            texts.append(" [SEP] ".join([prev_text, "START"]))
+                        else:
+                            texts.append(" [SEP] ".join([prev_text, labels[-2]]))
+
                 else:
                     texts.append(" [SEP] ".join([prev_loc[0], prev_text, prev_loc[1], text]))
 
@@ -465,15 +509,21 @@ def _make_texts(data, unused, out_path, desc_dict=None, conversion_dict=None, ve
                 prev_loc = [prev_loc[-1], d[1]]
     # if out_path.split("/")[-1][:6] ==  "distil":
     #     labels = _add_loc_description(labels, desc_dict)
-    if vectors is not None:
-        v_dict = {l:v for l, v in zip(*vectors)}
-        label_vectors = [v_dict[l] for l in labels]
+    if vectors is not None or matrix:
+        if vectors is not None:
+            v_dict = {l:v for l, v in zip(*vectors)}
+            label_vectors = [v_dict[l] for l in labels]
         if out_path[-1] == "6":
             e = np.where(np.array(labels) == "END")[0] + 1
             s = np.insert(e, 0, 0)[:-1]
-            _label_vectors = [[v_dict[l] for l in labels[_s:_e]] for _s, _e in zip(s, e)]
-            label_vectors = [np.concatenate([l_v, _l[i]])
-                             for _l in _label_vectors for i, l_v in enumerate([v_dict["START"]] + _l[:-1])]
+            if vectors is not None:
+                _label_vectors = [[v_dict[l] for l in labels[_s:_e]] for _s, _e in zip(s, e)]
+                label_vectors = [np.concatenate([l_v, _l[i]])
+                                 for _l in _label_vectors for i, l_v in enumerate([v_dict["START"]] + _l[:-1])]
+            else:
+                _labels = [labels[_s:_e] for _s, _e in zip(s, e)]
+                label_vectors = [[l_v, _l[i]]
+                                 for _l in _labels for i, l_v in enumerate(["START"] + _l[:-1])]
 
             # label_vectors = [np.concatenate([l_v, label_vectors[i]]) for i, l_v in enumerate([v_dict["START"]] +
             #                                                                             label_vectors[:-1])]
@@ -518,7 +568,7 @@ class MatrixTrainer(Trainer):
             out_sims = util.dot_score(out, self.vectors.to(logits.device))
         elif self.w_scales:
             # bi, bi -> bi; bi, ij -> bj
-            out_sims = out * weights @ self.vectors.to(logits.device).T
+             out_sims = out * weights @ self.vectors.to(logits.device).T
         else:
             out_sims = util.cos_sim(out, self.vectors.to(logits.device))
         # label_sims = torch.zeros_like(out_sims)
@@ -578,16 +628,38 @@ class VectorTrainer(Trainer):
         loss = loss_fct(out_sims, labels)
         return (loss, outputs) if return_outputs else loss
 
+
+from sklearn.preprocessing import LabelEncoder
+class LabelEncoder2(LabelEncoder):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    def transform2(self, y):
+        """
+        transform transition labels. This transforms pairs of labels to numbers
+        :param y:
+        :return:
+        """
+        return [np.ravel_multi_index(self.transform(_y), (len(self.classes_), len(self.classes_))) for _y in y]
+        # return [self.transform(_y) @ np.array([len(self.classes_), 1]) for _y in y]
+
+    def inverse_transform2(self, y):
+        """
+        from number to pair of label indices
+        :param y:
+        :return:
+        """
+        return [np.unravel_index(_y, (len(self.classes_), len(self.classes_))) for _y in y]
+
 def train_classifier(data_path, return_data=False, out_path=None, first_train_size=0.4, val_size=0.1, test_size=0.1,
-                     conversion_dict=None, vectors=None, matrix=False, v_scales=False, w_scales=False, wd=0.01):
+                     conversion_dict=None, vectors=None, matrix=False, v_scales=False, w_scales=False, wd=0.01, ner=False, use_bins=False):
     from sklearn.model_selection import train_test_split
     from transformers import Trainer, TrainingArguments
     from transformers import DebertaV2Tokenizer, DebertaV2ForSequenceClassification
+    from transformers import LukeTokenizer, LukeForSequenceClassification
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     from sklearn.metrics import accuracy_score
     from datasets import load_metric
-    from sklearn.preprocessing import LabelEncoder
     import joblib
 
     if torch.cuda.is_available():
@@ -614,6 +686,12 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
         eval_labels = [find_closest(vectors[0], vectors[1], v, v_scales=v_scales) for v in labels]
         return metric.compute(predictions=predictions, references=eval_labels)
 
+    def compute_metrics2_2(eval_pred):
+        logits, labels = eval_pred
+        _labels = encoder.inverse_transform2(labels)
+        predictions = [np.argmax(_logits.reshape(len(encoder.classes_), -1)[_l[0]]) for _logits, _l in zip(logits, _labels)]
+        return metric.compute(predictions=predictions, references=list(zip(*_labels))[1])
+
     def compute_metrics3(eval_pred):
         with torch.no_grad():
             vs, labels = eval_pred
@@ -638,9 +716,12 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
         data = json.load(infile)
         for u in unused:
             data.pop(u, None)
+        if ner:
+            print("adding NERs")
+            _add_locs(data, "[SEP]" if out_path.split('/')[-1].find("deberta") >= 0 else "</s>")
 
         if vectors is None:
-            _, all_labels = _make_texts(data, [], out_path, conversion_dict=conversion_dict)
+            _, all_labels = _make_texts(data, [], out_path, conversion_dict=conversion_dict, ners=ner, use_bins=use_bins)
         if test_size > 0:
             train_data = {t: text for t, text in list(data.items())[:int(first_train_size * len(data))]}
             val_data = {t: text for t, text in list(data.items())[-int(test_size * len(data))-int(val_size * len(data)):
@@ -649,16 +730,22 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
         else:
             train_data = data
 
-    train_texts, train_labels = _make_texts(train_data, unused, out_path, conversion_dict=conversion_dict, vectors=vectors)
+    train_texts, train_labels = _make_texts(train_data, unused, out_path, conversion_dict=conversion_dict, vectors=vectors, ners=ner, use_bins=use_bins, matrix=matrix)
 
-    encoder = LabelEncoder()
+    encoder = LabelEncoder2()
 
-    val_texts, val_labels = _make_texts(val_data, unused, out_path, conversion_dict=conversion_dict, vectors=vectors)
+    val_texts, val_labels = _make_texts(val_data, unused, out_path, conversion_dict=conversion_dict, vectors=vectors, ners=ner, use_bins=use_bins, matrix=matrix)
     if vectors is None:
         encoder.fit(all_labels)
         joblib.dump(encoder, out_path + '/label_encoder.pkl')
-        val_labels = encoder.transform(val_labels)
-        train_labels = encoder.transform(train_labels)
+        if not matrix:
+            val_labels = encoder.transform(val_labels)
+            train_labels = encoder.transform(train_labels)
+        else:
+            val_labels = encoder.transform2(val_labels)
+            train_labels = encoder.transform2(train_labels)
+
+        print(f"{len(encoder.classes_)} labels")
 
     print("made data")
     print(f"*************** {out_path.split('/')[-1]} **************")
@@ -666,14 +753,19 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
     distilroberta = out_path.split('/')[-1].find("distil") >= 0
     albert = out_path.split('/')[-1].find("albert") >= 0
     minilm = out_path.split('/')[-1].find("minilm") >= 0
+    luke = out_path.split('/')[-1].find("luke") >= 0
+
     if distilroberta:
         tokenizer = AutoTokenizer.from_pretrained("distilroberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
     elif albert:
         tokenizer = AutoTokenizer.from_pretrained('albert-large-v2', cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
     elif minilm:
         tokenizer = AutoTokenizer.from_pretrained('nreimers/MiniLMv2-L6-H384-distilled-from-RoBERTa-Large', cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+    elif luke:
+        tokenizer = LukeTokenizer.from_pretrained("studio-ousia/luke-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
     else:
-        tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+        # tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
+        tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-base", cache_dir="/cs/snapless/oabend/eitan.wagner/cache/")
 
     train_encodings = tokenizer(train_texts, truncation=True, padding=True)
     val_encodings = tokenizer(val_texts, truncation=True, padding=True)
@@ -686,12 +778,15 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
         return train_dataset, val_dataset
 
     training_args = TrainingArguments(
-        output_dir='./results',          # output directory
+        output_dir='/cs/labs/oabend/eitan.wagner/checkpoints/results',          # output directory
         num_train_epochs=3,              # total number of training epochs
         learning_rate=5e-5,
-        per_device_train_batch_size=8 if distilroberta else 4 if not minilm else 16,  # batch size per device during training
-        per_device_eval_batch_size=8 if distilroberta else 4 if not minilm else 16,   # batch size for evaluation
-        gradient_accumulation_steps=1 if distilroberta else 2 if not minilm else 1,
+        # per_device_train_batch_size=8 if distilroberta else 4 if not minilm else 16,  # batch size per device during training
+        # per_device_eval_batch_size=8 if distilroberta else 4 if not minilm else 16,   # batch size for evaluation
+        # gradient_accumulation_steps=1 if distilroberta else 2 if not minilm else 1,
+        per_device_train_batch_size=2 if not minilm else 16,  # batch size per device during training
+        per_device_eval_batch_size=2 if not minilm else 16,   # batch size for evaluation
+        gradient_accumulation_steps=4 if not minilm else 1,
         # learning_rate=5e-5,
         # per_device_train_batch_size=16,  # batch size per device during training
         # per_device_eval_batch_size=64,   # batch size for evaluation
@@ -701,15 +796,16 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
         logging_steps=10,
         evaluation_strategy="epoch",
         save_strategy="epoch",
-        load_best_model_at_end=True,
+        # load_best_model_at_end=True,
 
     )
 
     # p_type = "multi_label_classification" if vectors is None else \
     #     "regression" if not matrix else None
     # p_type = "multi_label_classification" if vectors is None else "regression"
-    p_type = "multi_label_classification" if vectors is None else None
-    n_labels = len(encoder.classes_) if vectors is None else \
+    # p_type = "multi_label_classification" if vectors is None else None
+    p_type = "single_label_classification" if vectors is None else None
+    n_labels = (len(encoder.classes_) if not matrix else len(encoder.classes_) **2) if vectors is None else \
         len(vectors[1][0]) if not matrix else len(vectors[1][0]) ** 2
     if w_scales:
         n_labels = n_labels + len(vectors[1][0])
@@ -725,8 +821,15 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
         model = AutoModelForSequenceClassification.from_pretrained('nreimers/MiniLMv2-L6-H384-distilled-from-RoBERTa-Large',
                                                                cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
                                                                num_labels=n_labels, problem_type=p_type)
+    elif luke:
+        model = LukeForSequenceClassification.from_pretrained("studio-ousia/luke-base",
+                                                               cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
+                                                               num_labels=n_labels, problem_type=p_type)
     else:
-        model = AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-base",
+        # model = AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-base",
+        #                                                        cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
+        #                                                        num_labels=n_labels, problem_type=p_type)
+        model = AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-v2-base",
                                                                cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
                                                                num_labels=n_labels, problem_type=p_type)
     model.to(dev)
@@ -739,7 +842,7 @@ def train_classifier(data_path, return_data=False, out_path=None, first_train_si
             args=training_args,  # training arguments, defined above
             train_dataset=train_dataset,  # training dataset
             eval_dataset=val_dataset,  # evaluation dataset
-            compute_metrics=compute_metrics,
+            compute_metrics=compute_metrics if not matrix else compute_metrics2_2,
         )
     elif not matrix:
         _Trainer = VectorTrainer
@@ -1049,7 +1152,7 @@ def beam_decode(model, tokenizer, encoder, test_data, k=3, only_loc=False, only_
 
 class LocCRF:
     def __init__(self, model_path, model_path2=None, use_prior='', conversion_dict=None, vectors=None, theta=None,
-                 train_vectors=False, v_scales=False, w_scales=False):
+                 train_vectors=False, v_scales=False, w_scales=False, divide_hidden2=False, ner=False, use_bins=False):
         from TorchCRF import CRF
         self.v_scales = v_scales
         self.w_scales = w_scales
@@ -1058,6 +1161,8 @@ class LocCRF:
         self.conversion_dict = conversion_dict
         self.vectors = vectors
         self.train_vectors = train_vectors
+        self.ner = ner
+        self.use_bins = use_bins
         if vectors is None:
             self.encoder = joblib.load(model_path + "/label_encoder.pkl")
             self.classes = self.encoder.classes_
@@ -1068,9 +1173,12 @@ class LocCRF:
             self.start_id = self.classes.index("START")
             from loc_clusters import SBertEncoder
             if train_vectors:
-                self.encoder = SBertEncoder(vectors=None, conversion_dict=conversion_dict, cat=True).to(dev3)
-                self.vectors = self.encoder.classes_, self.encoder.vectors.detach()
-                self.vectors[1].requires_grad = True
+                self.encoder = SBertEncoder(vectors=vectors, train_vectors=True)
+                self.vectors = self.encoder.classes_, self.encoder.vectors
+
+                # self.encoder = SBertEncoder(vectors=None, conversion_dict=conversion_dict, cat=True).to(dev3)
+                # self.vectors = self.encoder.classes_, self.encoder.vectors.detach()
+                # self.vectors[1].requires_grad = True
             else:
                 self.encoder = SBertEncoder(vectors=vectors)
 
@@ -1092,7 +1200,7 @@ class LocCRF:
 
         # self.p_model = None
         n_labels = len(self.classes) if model_path.split('/')[-1][0] != "v" else len(vectors[1][0])
-        n_labels2 = len(self.classes) if vectors is None else len(vectors[1][0]) ** 2
+        n_labels2 = len(self.classes) ** 2 if vectors is None else len(vectors[1][0]) ** 2
         if self.w_scales:
             n_labels += len(vectors[1][0])
             n_labels2 += len(vectors[1][0])
@@ -1102,8 +1210,8 @@ class LocCRF:
         self.model = AutoModelForSequenceClassification.from_pretrained(model_path,
                                                                         cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
                                                                         num_labels=n_labels, problem_type=p_type).to(dev)
-        print(f"******************** {model_path2.split('/')[-1]} *******************************")
         if model_path2 is not None:
+            print(f"******************** {model_path2.split('/')[-1]} *******************************")
             self.model2 = AutoModelForSequenceClassification.from_pretrained(model_path2,
                                                                              cache_dir="/cs/snapless/oabend/eitan.wagner/cache/",
                                                                              num_labels=n_labels2, problem_type=p_type).to(dev2)
@@ -1123,7 +1231,8 @@ class LocCRF:
             pad_idx_val = -1.
         if use_prior == 'const':
             const = 0.1
-        self.crf = CRF(len(self.classes), pad_idx=pad_idx, pad_idx_val=pad_idx_val, const=const, theta=theta).to(dev3)
+        self.divide_hidden_2 = divide_hidden2
+        self.crf = CRF(len(self.classes), pad_idx=pad_idx, pad_idx_val=pad_idx_val, const=const, theta=theta, divide_h2=divide_hidden2).to(dev3)
         with torch.no_grad():
             self.crf.trans_matrix[:, self.start_id] = -10000.
             self.crf.trans_matrix[self.start_id, self.start_id] = 0.
@@ -1145,27 +1254,43 @@ class LocCRF:
         # shape (batch_size, seq_len, num_classes)
         hidden = torch.zeros(len(texts), max([len(t) for t in texts]), len(self.classes)).to(dev)
 
+        divide_hidden_2 = self.divide_hidden_2
         if self.model_path2 is not None:
             self.model2.to(dev2)
             # shape (batch_size, seq_len, num_classes, num_classes)
             seq_len = max([len(t) for t in texts])
-            hidden2 = torch.zeros(len(texts), seq_len, len(self.classes),
-                                  len(self.classes)).to(dev3)
-            # hidden2_2 = torch.zeros(len(texts), seq_len - seq_len//2, len(self.classes),
-            #                       len(self.classes)).to(dev3)
+            if divide_hidden_2:
+                hidden2 = torch.zeros(len(texts), seq_len // 5, len(self.classes),
+                                      len(self.classes)).to(dev3)
+                hidden2_2 = torch.zeros(len(texts), seq_len//5, len(self.classes),
+                                      len(self.classes)).to(dev4)
+                hidden2_3 = torch.zeros(len(texts), seq_len//5, len(self.classes),
+                                      len(self.classes)).to(dev5)
+                hidden2_4 = torch.zeros(len(texts), seq_len // 5, len(self.classes),
+                                      len(self.classes)).to(dev6)
+                hidden2_5 = torch.zeros(len(texts), seq_len - 4 * (seq_len//5), len(self.classes),
+                                      len(self.classes)).to(dev2)
+                # hidden2_6 = torch.zeros(len(texts), seq_len - 2 * (seq_len//6), len(self.classes),
+                #                       len(self.classes)).to(dev7)
+            else:
+                hidden2 = torch.zeros(len(texts), seq_len, len(self.classes),
+                                      len(self.classes)).to(dev3)
             # hidden2 = torch.zeros(len(texts), max([len(t) for t in texts]), len(self.classes),
             #                       len(self.classes)).to("cpu")
 
         if len(texts) == 0:
             return torch.from_numpy(hidden).to(dev)
         for k, text in tqdm.tqdm(enumerate(texts), desc="Make encodings", leave=False):
-            encodings = torch.tensor(self.tokenizer(text, truncation=True, padding=True)['input_ids'], dtype=torch.long).to(dev)
+            encodings = self.tokenizer(text, truncation=True, padding=True)['input_ids'].clone().detach().to(dev)
+            # encodings = torch.tensor(self.tokenizer(text, truncation=True, padding=True)['input_ids'], dtype=torch.long).to(dev)
 
             if self.model_path2 is not None and self.vectors is None:
-                cats = self.encoder.classes_
-                encodings2 = [torch.tensor(self.tokenizer([_text + " [SEP] " + c for _text in text], truncation=True,
-                                                          padding=True)['input_ids'], dtype=torch.long).to(dev2)
-                              for c in cats]
+                encodings2 = encodings
+                # cats = self.encoder.classes_
+                # encodings2 = [torch.tensor(self.tokenizer([_text + " [SEP] " + c for _text in text], truncation=True,
+                #                                           padding=True)['input_ids'], dtype=torch.long).to(dev2)
+                #               for c in cats]
+
             for j, e in enumerate(encodings):
                 # print("j: ", j)
                 # print("used on dev2:", torch.cuda.memory_allocated(dev2) / torch.cuda.max_memory_allocated(dev2))
@@ -1202,55 +1327,89 @@ class LocCRF:
                                 else:
                                     probs = util.cos_sim(logits, torch.from_numpy(self.vectors[1]).to(logits.device)).squeeze(0)
 
-                    outputs2 = self.model2(e.unsqueeze(0).to(dev2))
-                    # logits2 = outputs2.get('logits').squeeze(0)  # of shape (batch_size, vec_dim**2)?
-                    logits2 = outputs2.get('logits').squeeze(0).to(dev3)  # of shape (batch_size, vec_dim**2)?
+                    if self.model_path2 is not None:
+                        outputs2 = self.model2(e.unsqueeze(0).to(dev2))
+                        # logits2 = outputs2.get('logits').squeeze(0)  # of shape (batch_size, vec_dim**2)?
+                        if divide_hidden_2:
+                            if j >= 4 * (seq_len // 5):
+                                logits2 = outputs2.get('logits').squeeze(0).to(dev2)  # of shape (batch_size, vec_dim**2)?
+                            elif j >= 3 * (seq_len // 5):
+                                logits2 = outputs2.get('logits').squeeze(0).to(dev6)  # of shape (batch_size, vec_dim**2)?
+                            elif j >= 2 * (seq_len // 5):
+                                logits2 = outputs2.get('logits').squeeze(0).to(dev5)  # of shape (batch_size, vec_dim**2)?
+                            elif j >= seq_len // 5:
+                                logits2 = outputs2.get('logits').squeeze(0).to(dev4)  # of shape (batch_size, vec_dim**2)?
+                            else:
+                                logits2 = outputs2.get('logits').squeeze(0).to(dev3)  # of shape (batch_size, vec_dim**2)?
+                        else:
+                            logits2 = outputs2.get('logits').squeeze(0).to(dev3)
+                        # here we work with a single input
+                        if self.w_scales:
+                            weights2 = logits2[-len(self.vectors[1][0]):]
+                            logits2 = logits2[:-len(self.vectors[1][0])]
+                            if self.train_vectors:
+                                out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ self.vectors[1].to(logits2.device).T
+                                probs2 = (out2 * weights2 @ self.vectors[1].to(logits2.device).T)
+                            else:
+                                out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ torch.from_numpy(self.vectors[1]).to(logits2.device).T
+                                probs2 = (out2 * weights2 @ torch.from_numpy(self.vectors[1]).to(logits2.device).T).squeeze(0)
+                        else:
+                            if self.train_vectors:
+                                # out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ self.vectors[1].to(logits2.device).T
+                                out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ self.vectors[1].to(logits2.device).T
+                                if self.v_scales:
+                                    probs2 = util.dot_score(out2.T, self.vectors[1].to(logits2.device))
+                                else:
+                                    probs2 = util.cos_sim(out2.T, self.vectors[1].to(logits2.device))
+                                if divide_hidden_2:
+                                    if j >= 2*(seq_len // 3):
+                                        hidden2_3[k, j - 2 * (seq_len // 3), :, :] = probs2
+                                    elif j >= seq_len // 3:
+                                        hidden2_2[k, j - seq_len // 3, :, :] = probs2
+                                    else:
+                                        hidden2[k, j, :, :] = probs2
+                                else:
+                                    hidden2[k, j, :, :] = probs2
+                                # hidden2[k, j, :, :] = probs2.to(dev3)
+                            else:
+                                out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ torch.from_numpy(self.vectors[1]).to(logits2.device).T
+                                if SOFTMAX:
+                                    out2 = out2.log_softmax(dim=-1)
 
-                    # here we work with a single input
-                    if self.w_scales:
-                        weights2 = logits2[-len(self.vectors[1][0]):]
-                        logits2 = logits2[:-len(self.vectors[1][0])]
-                        if self.train_vectors:
-                            out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ self.vectors[1].to(logits2.device).T
-                            probs2 = (out2 * weights2 @ self.vectors[1].to(logits2.device).T)
-                        else:
-                            out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ torch.from_numpy(self.vectors[1]).to(logits2.device).T
-                            probs2 = (out2 * weights2 @ torch.from_numpy(self.vectors[1]).to(logits2.device).T).squeeze(0)
-                    else:
-                        if self.train_vectors:
-                            # out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ self.vectors[1].to(logits2.device).T
-                            out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ self.vectors[1].to(logits2.device).T
-                            if self.v_scales:
-                                probs2 = util.dot_score(out2.T, self.vectors[1].to(logits2.device))
-                            else:
-                                probs2 = util.cos_sim(out2.T, self.vectors[1].to(logits2.device))
-                            hidden2[k, j, :, :] = probs2
-                            # hidden2[k, j, :, :] = probs2.to(dev3)
-                        else:
-                            out2 = logits2.reshape(int(logits2.shape[-1] ** .5), int(logits2.shape[-1] ** .5)) @ torch.from_numpy(self.vectors[1]).to(logits2.device).T
-                            if self.v_scales:
-                                # probs2 = util.dot_score(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
-                                # hidden2[k, j, :, :] = util.cos_sim(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
-                                hidden2[k, j, :, :] = util.dot_score(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
-                            else:
-                                probs2 = util.cos_sim(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
-                                hidden2[k, j, :, :] = probs2
-                        # probs2 should be a tensor of shape (num_classes, num_classes)
-                        # probs2 = util.cos_sim(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device)).log_softmax(dim=1)
+                                if self.v_scales:
+                                    # probs2 = util.dot_score(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
+                                    # hidden2[k, j, :, :] = util.cos_sim(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
+                                    if divide_hidden_2:
+                                        if j >= 4*(seq_len // 5):
+                                            hidden2_5[k, j - 4*(seq_len // 5), :, :] = util.dot_score(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
+                                        elif j >= 3*(seq_len // 5):
+                                            hidden2_4[k, j - 3*(seq_len // 5), :, :] = util.dot_score(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
+                                        elif j >= 2*(seq_len // 5):
+                                            hidden2_3[k, j - 2*(seq_len // 5), :, :] = util.dot_score(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
+                                        elif j >= seq_len // 5:
+                                            hidden2_2[k, j - seq_len // 5, :, :] = util.dot_score(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
+                                        else:
+                                            hidden2[k, j, :, :] = util.dot_score(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
+                                    else:
+                                        hidden2[k, j, :, :] = util.dot_score(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
+                                else:
+                                    probs2 = util.cos_sim(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device))
+                                    hidden2[k, j, :, :] = probs2
+                            # probs2 should be a tensor of shape (num_classes, num_classes)
+                            # probs2 = util.cos_sim(out2.T, torch.from_numpy(self.vectors[1]).to(logits2.device)).log_softmax(dim=1)
 
                 hidden[k, j, :probs.shape[0]] = probs
 
             if self.model_path2 is not None and self.vectors is None:
-                for _c, _encodings2 in enumerate(encodings2):  # category
-                    # probs2 = torch.zeros(len(self.encoder.classes_), len(self.encoder.classes_)).to(dev2)
-                    for j in range(0, len(_encodings2), 8):  # location in testimony
-                        probs2 = self.model2(_encodings2[j: j+8].to(dev2)).logits
-                        # print(probs2.shape)
-                        hidden2[k, j: j+probs2.shape[0], _c, :] = probs2
-
-                    # for j, e in enumerate(_encodings2):  # location in testimony
-                    #     probs2 = self.model2(e.unsqueeze(0).to(dev2)).logits[0]
-                        # hidden2[k, j, _c, :] = probs2
+                for j, e in enumerate(encodings2):
+                    probs2 = self.model2(e.to(dev2)).logits
+                    hidden2[k, j, :, :] = probs2.reshape(len(self.classes), -1)
+                # for _c, _encodings2 in enumerate(encodings2):  # category
+                #
+                #     for j in range(0, len(_encodings2), 8):  # location in testimony
+                #         probs2 = self.model2(_encodings2[j: j+8].to(dev2)).logits
+                #         # print(probs2.shape)
+                #         hidden2[k, j: j+probs2.shape[0], _c, :] = probs2
 
             # probs = self.model(encodings).logits.detach().cpu().numpy()
             # hidden[k, :probs.shape[0], :probs.shape[1]] = probs
@@ -1260,6 +1419,8 @@ class LocCRF:
         # if self.model_path2 is not None:
         #     hidden2.requires_grad_()
         if self.model_path2 is not None:
+            if divide_hidden_2:
+                return hidden, hidden2, hidden2_2, hidden2_3, hidden2_4, hidden2_5
             return hidden, hidden2
         return hidden
 
@@ -1282,7 +1443,8 @@ class LocCRF:
                 labels = np.zeros((_batch_size, max([len(t) for t in eval_batch])), dtype=int)
 
                 for j, _t in enumerate(eval_batch):
-                    _texts, _labels = _make_texts({1: _t}, unused=[], out_path="1", conversion_dict=self.conversion_dict)  # only current text
+                    _texts, _labels = _make_texts({1: _t}, unused=[], out_path=("v_all" if self.model_path.find("v_all") >= 0 else "") + "1", conversion_dict=self.conversion_dict, ners=self.ner, use_bins=self.use_bins)  # only current text
+                    # _texts, _labels = _make_texts({1: _t}, unused=[], out_path="1", conversion_dict=self.conversion_dict)  # only current text
                     label_mask[j, :len(_t)] = 1
                     labels[j, :len(_t)] = self.encoder.transform(_labels)
                     texts.append(_texts)
@@ -1290,7 +1452,10 @@ class LocCRF:
 
                 # hidden = self._forward(texts).detach()
                 if self.model_path2 is not None:
-                    hidden, hidden2 = self._forward(texts)
+                    if self.divide_hidden_2:
+                        hidden, hidden2, hidden2_2, hidden2_3, hidden2_4, hidden2_5 = self._forward(texts)
+                    else:
+                        hidden, hidden2 = self._forward(texts)
                     # hidden2 = hidden2.to(dev)
                     hidden2 = hidden2.to(dev3)
                 else:
@@ -1302,7 +1467,10 @@ class LocCRF:
                 labels = torch.from_numpy(labels).to(dev3)
 
                 # self.crf.eval()
-                loss = -self.crf.forward(hidden.to(dev3), labels, mask, h2=hidden2).mean()
+                if self.divide_hidden_2:
+                    loss = -self.crf.forward(hidden.to(dev3), labels, mask, h2=[hidden2, hidden2_2, hidden2_3, hidden2_4, hidden2_5]).mean()
+                else:
+                    loss = -self.crf.forward(hidden.to(dev3), labels, mask, h2=hidden2).mean()
                 # self.crf.train()
                 losses.append(loss.item())
                 # print(loss.item())
@@ -1319,13 +1487,6 @@ class LocCRF:
         # self.model.eval()  # don't train model
         print(f"******************* leaving layers {layers} unfrozen!!!!!!!!! *******************")
 
-        self.model.train()
-        for name, param in self.model.named_parameters():
-            if np.any([name.find(str(_l)) >= 0 for _l in layers + ["classifier", "pooler"]]):
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-                # param.requires_grad = False
         if self.model_path2 is not None:
             self.model2.train()
             for name, param in self.model2.named_parameters():
@@ -1337,10 +1498,21 @@ class LocCRF:
                 else:
                     param.requires_grad = False
 
+        if self.model_path.find("deberta") >= 0:  # TODO
+            layers = []
+        self.model.train()
+        for name, param in self.model.named_parameters():
+            if np.any([name.find(str(_l)) >= 0 for _l in layers + ["classifier", "pooler"]]):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+                # param.requires_grad = False
+
         # self.p_model = nn.DataParallel(model, device_ids=[0, 1, 2, 3])
 
         if self.model_path2 is None:
-            optimizer = optim.AdamW(list(self.crf.parameters()) + list(self.model.parameters()))
+            # optimizer = optim.AdamW(list(self.crf.parameters()) + list(self.model.parameters()))
+            optimizer = optim.AdamW(list(self.crf.parameters()) + list(self.model.parameters()), lr=5e-5, weight_decay=wd)
         elif not self.train_vectors:
             optimizer = optim.AdamW(list(self.crf.parameters()) + list(self.model.parameters()) +
                                    list(self.model2.parameters()), lr=5e-5, weight_decay=wd)
@@ -1361,10 +1533,10 @@ class LocCRF:
         name = self.save_model(epoch=epochs)  # TODO:
         if self.model_path2 is not None:
             crf_eval(data_path=test_dict['data_path'], model_path=test_dict['model_path'], model_path2=test_dict['model_path2'],
-                     test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name, vectors=self.vectors)
+                     test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name, vectors=self.vectors, ner=self.ner)
         else:
             crf_eval(data_path=test_dict['data_path'], model_path=test_dict['model_path'],
-                     test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name, vectors=self.vectors)
+                     test_size=test_dict['test_size'], val_size=test_dict['val_size'], name=name, vectors=self.vectors, ner=self.ner)
 
         for e in range(epochs):
             self.model.train()
@@ -1390,7 +1562,7 @@ class LocCRF:
                 labels = np.zeros((_batch_size, max([len(t) for t in train_batch])), dtype=int)
 
                 for j, _t in enumerate(train_batch):
-                    _texts, _labels = _make_texts({1: _t}, unused=[], out_path=self.model_path, conversion_dict=self.conversion_dict)  # only current text
+                    _texts, _labels = _make_texts({1: _t}, unused=[], out_path=self.model_path, conversion_dict=self.conversion_dict, ners=self.ner, use_bins=self.use_bins)  # only current text
                     label_mask[j, :len(_t)] = 1
                     labels[j, :len(_t)] = self.encoder.transform(_labels)
                     texts.append(_texts)
@@ -1398,9 +1570,12 @@ class LocCRF:
 
                 if self.model_path2 is not None:
                     # with torch.no_grad():
+                    if self.divide_hidden_2:
+                        hidden, hidden2, hidden2_2, hidden2_3, hidden2_4, hidden2_5 = self._forward(texts)
+                    else:
                         hidden, hidden2 = self._forward(texts)
                         # hidden2 = hidden2.to(dev)
-                        hidden2 = hidden2.to(dev3)
+                    hidden2 = hidden2.to(dev3)
                 else:
                     hidden, hidden2 = self._forward(texts), None
 
@@ -1410,8 +1585,10 @@ class LocCRF:
                 # labels = torch.from_numpy(labels).to(dev)
                 labels = torch.from_numpy(labels).to(dev3)
                 # labels = torch.LongTensor(self.encoder.transform(labels)).unsqueeze(0).to(dev)  # (batch_size, sequence_size)
-
-                loss = -self.crf.forward(hidden.to(dev3), labels, mask, h2=hidden2).mean() / accu_grad
+                if self.divide_hidden_2:
+                    loss = -self.crf.forward(hidden.to(dev3), labels, mask, h2=[hidden2, hidden2_2, hidden2_3, hidden2_4, hidden2_5]).mean() / accu_grad
+                else:
+                    loss = -self.crf.forward(hidden.to(dev3), labels, mask, h2=hidden2).mean() / accu_grad
                 # loss = criterion(y_pred, label)
                 loss.backward()
                 if accu_grad == 1 or (i+1) % accu_grad == 0 or i+accu_grad >= len(_train) or _batch_size < batch_size:
@@ -1436,11 +1613,16 @@ class LocCRF:
 
     def decode(self, test_data):
 
-        texts, labels = _make_texts(test_data, unused=[], out_path=self.model_path, conversion_dict=self.conversion_dict)  # only current text
+        texts, labels = _make_texts(test_data, unused=[], out_path=self.model_path, conversion_dict=self.conversion_dict, ners=self.ner, use_bins=self.use_bins)  # only current text
         with torch.no_grad():
             self.model.eval()
             if self.model_path2 is None:
-                hidden, hidden2 = self._forward([texts]), None
+                if self.divide_hidden_2:
+                    self.divide_hidden_2 = False
+                    hidden, hidden2 = self._forward([texts]), None
+                    self.divide_hidden_2 = True
+                else:
+                    hidden, hidden2 = self._forward([texts]), None
                 # hidden = self._forward([texts])
                 # hidden.detach()
                 # mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size. sequence_size)
@@ -1449,7 +1631,12 @@ class LocCRF:
                 return self.crf.viterbi_decode(hidden.to(dev3), mask, h2=hidden2)[0], labels  # predictions and labels
             else:
                 self.model2.eval()
-                hidden, hidden2 = self._forward([texts])
+                if self.divide_hidden_2:
+                    self.divide_hidden_2 = False
+                    hidden, hidden2 = self._forward([texts])
+                    self.divide_hidden_2 = True
+                else:
+                    hidden, hidden2 = self._forward([texts])
                 # hidden2.detach()
                 # mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev)  # (batch_size, sequence_size)
                 mask = torch.ones((1, len(labels)), dtype=torch.bool).to(dev3)  # (batch_size, sequence_size)
@@ -1516,7 +1703,7 @@ def decode(data_path, model_path, only_loc=False, only_text=False, val_size=0.1,
     eds_g, sms_g, accs_g, f1s_g = [], [], [], []
     eds_b, sms_b, accs_b, f1s_b = [], [], [], []
 
-    for t, t_data in test_data.items():
+    for i, (t, t_data) in enumerate(test_data.items()):
         pred, labels = greedy_decode(model, tokenizer, encoder, test_data={t: t_data}, only_loc=only_loc,
                                      only_text=only_text, conversion_dict=c_dict)
         # print(encoder.inverse_transform(pred[:10]))
@@ -1525,8 +1712,12 @@ def decode(data_path, model_path, only_loc=False, only_text=False, val_size=0.1,
         preds, labels = beam_decode(model, tokenizer, encoder, test_data={t: t_data}, k=3, only_loc=only_loc,
                                     only_text=only_text, conversion_dict=c_dict)
         ed_b, sm_b, acc_b, f1_b = _eval(encoder.transform(preds[0][0]), labels)
-        # print(preds[0][0][:10])
-        # print(encoder.inverse_transform(labels[:10]))
+
+        # if i < 10:
+        #     print(preds[0][0])
+        #     print(encoder.inverse_transform(labels))
+        # else:
+        #     break
 
         eds_g.append(ed_g / len(labels))
         eds_b.append(ed_b / len(labels))
@@ -1550,7 +1741,7 @@ def decode(data_path, model_path, only_loc=False, only_text=False, val_size=0.1,
 
 def crf_decode(data_path, model_path, model_path2=None, first_train_size=0.4, val_size=0.1, test_size=0.1, use_prior='', batch_size=4,
                epochs=10, conversion_dict=None, accu_grad=1, vectors=None, theta=None, train_vectors=False, v_scales=False,
-               w_scales=False, layers=None, wd=None):
+               w_scales=False, layers=None, wd=None, divide_hidden2=False, ner=False, use_bins=False):
     """
 
     :param data_path:
@@ -1572,6 +1763,10 @@ def crf_decode(data_path, model_path, model_path2=None, first_train_size=0.4, va
         data = json.load(infile)
         for u in unused:
             data.pop(u, None)
+        if ner:
+            print("adding NERs")
+            _add_locs(data, "[SEP]" if model_path.split('/')[-1].find("deberta") >= 0 else "</s>")
+
     print(f"With {len(data)} documents")
 
     if test_size > 0:
@@ -1587,12 +1782,12 @@ def crf_decode(data_path, model_path, model_path2=None, first_train_size=0.4, va
         train_data = data
     loc_crf = LocCRF(model_path, model_path2=model_path2, use_prior=use_prior,
                      conversion_dict=conversion_dict, vectors=vectors, theta=theta, train_vectors=train_vectors,
-                     v_scales=v_scales, w_scales=w_scales).train(train_data, batch_size=batch_size, epochs=epochs,
+                     v_scales=v_scales, w_scales=w_scales, divide_hidden2=divide_hidden2, ner=ner, use_bins=use_bins).train(train_data, batch_size=batch_size, epochs=epochs,
                                                                  test_dict=test_dict, test_data=test_data, accu_grad=accu_grad,
                                                                  layers=layers, wd=wd)
     return loc_crf.save_model()
 
-def crf_eval(data_path, model_path, model_path2=None, val_size=0., test_size=0., name='', vectors=None):
+def crf_eval(data_path, model_path, model_path2=None, val_size=0., test_size=0., name='', vectors=None, ner=False):
     print(f"Eval ({name})")
     if vectors is None:
         encoder = joblib.load(model_path + "/label_encoder.pkl")
@@ -1608,6 +1803,9 @@ def crf_eval(data_path, model_path, model_path2=None, val_size=0., test_size=0.,
         data = json.load(infile)
         for u in unused:
             data.pop(u, None)
+        if ner:
+            print("adding NERs")
+            _add_locs(data, "[SEP]" if model_path.split('/')[-1].find("deberta") >= 0 else "</s>")
     loc_crf = joblib.load(model_path + name)
 
     return_dict = {}
@@ -1657,22 +1855,33 @@ def main():
     _model_name = None
     model_path2 = None
     c_dict = None
-    use_vectors = 'v'
+
     # use_vectors = ''
     vectors = None
     if "-m" in sys.argv:
         _model_name = sys.argv[sys.argv.index("-m") + 1]
-        model_name2 = _model_name + "6"
         model_names1 = [_model_name + "1"]
+        if "-m2" in sys.argv:
+            _model_name2 = sys.argv[sys.argv.index("-m2") + 1]
+            if _model_name2 == "":
+                model_name2 = None
+            else:
+                model_name2 = _model_name2 + "6"
+        else:
+            model_name2 = _model_name + "6"
     else:
         model_name2 = "distilroberta6"
         model_names1 = ["distilroberta1"]
     use_vectors1 = "v" if "use_vectors1" in sys.argv else ""
+    use_vectors = 'v' if "use_vectors2" in sys.argv else ""
+    use_bins = "use_bins" in sys.argv
     make_vectors = "make_vectors" in sys.argv
     train_vectors = "train_vectors" in sys.argv
     _train_classifier = "train_classifier" in sys.argv
     _train_classifier2 = "train_classifier2" in sys.argv
     _crf = "crf" in sys.argv
+    ner = "ner" in sys.argv
+    divide_hidden2 = "divide_h2" in sys.argv
     v_scales = "v_scales" in sys.argv
     w_scales = "w_scales" in sys.argv  # weighted scales
     all_locs = "all_locs" in sys.argv
@@ -1738,12 +1947,21 @@ def main():
                 model_name = "all_" + model_name
                 if model_name2 is not None:
                     model_name2 = "all_" + model_name2
+            if ner:
+                model_name = "ner_" + model_name
+                if model_name2 is not None:
+                    model_name2 = "ner_" + model_name2
+            if use_bins:
+                model_name = "b_" + model_name
+                if model_name2 is not None:
+                    model_name2 = "b_" + model_name2
             if use_vectors1 != "":
                 model_name = "v_" + model_name
             if use_vectors != "" and model_name2 is not None:
                 model_name2 = "v_" + model_name2
             if v_scales:
-                model_name = "v" + model_name
+                if use_vectors1:
+                    model_name = "v" + model_name
                 if model_name2 is not None:
                     model_name2 = "v" + model_name2
             if w_scales:
@@ -1763,13 +1981,13 @@ def main():
                                                               first_train_size=first_train_size, val_size=0.1, test_size=0.1,
                                                               conversion_dict=c_dict, vectors=vectors,
                                                               matrix=model_name[-1] == "6", v_scales=v_scales,
-                                                              w_scales=w_scales, wd=wd)
+                                                              w_scales=w_scales, wd=wd, ner=ner, use_bins=use_bins)
             if _train_classifier2:
                 train_dataset, val_dataset = train_classifier(data_path, return_data=False, out_path=model_path2,
                                                               first_train_size=first_train_size, val_size=0.1, test_size=0.1,
                                                               conversion_dict=c_dict, vectors=vectors,
                                                               matrix=model_name2[-1] == "6", v_scales=v_scales,
-                                                              w_scales=w_scales, wd=wd)
+                                                              w_scales=w_scales, wd=wd, ner=ner, use_bins=use_bins)
             # train_dataset, val_dataset = train_multiple_choice(data_path, return_data=False, out_path=model_path,
             #                                                    first_train_size=first_train_size, val_size=0.1, test_size=0.1)
             # train_dataset, val_dataset = train_classifier(data_path, return_data=True, out_path=model_path)
@@ -1778,9 +1996,9 @@ def main():
                 # first_train_size=0 mean we retrain on all documents
                 name = crf_decode(data_path, model_path, model_path2, first_train_size=0., val_size=0.1, test_size=0.1, use_prior=prior,
                                   batch_size=batch_size, epochs=epochs, conversion_dict=c_dict, accu_grad=accu_grad, vectors=vectors,
-                                  theta=theta, train_vectors=train_vectors, v_scales=v_scales, w_scales=w_scales, layers=layers, wd=wd)
+                                  theta=theta, train_vectors=train_vectors, v_scales=v_scales, w_scales=w_scales, layers=layers, wd=wd, divide_hidden2=divide_hidden2, ner=ner, use_bins=use_bins)
                 # name = "/crf_I1_b16_ee78.pkl"
-                d = crf_eval(data_path, model_path, val_size=0.1, test_size=0.1, name=name, vectors=vectors)
+                d = crf_eval(data_path, model_path, val_size=0.1, test_size=0.1, name=name, vectors=vectors, ner=ner)
                 #
 
                 # evaluate(model_path, val_dataset=val_dataset)
@@ -1788,12 +2006,10 @@ def main():
     # model_name = "deberta"
     # # # model_name = "deberta1"
     # print("Greedy and Beam ")
-    # print(model_name)
-    # model_path = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/" + model_name
+    # print(model_names1[0])
+    # model_path = "/cs/snapless/oabend/eitan.wagner/segmentation/models/locations/" + model_names1[0]
     # # only_loc, only_text = False, False
-    # only_loc = model_name == "deberta3"
-    # only_text = model_name == "deberta1"
-    # decode(data_path, model_path, val_size=0.1, test_size=0.1, only_loc=only_loc, only_text=only_text, c_dict=c_dict)
+    # decode(data_path, model_path, val_size=0.1, test_size=0.1, only_loc=model_names1[0] == "deberta3", only_text=model_names1[0] == "deberta1", c_dict=c_dict)
     #
     if _crf:
         for t, v in d.items():

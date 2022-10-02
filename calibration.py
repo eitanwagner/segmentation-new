@@ -138,8 +138,8 @@ def T5_mask_filling(noun_count=100, adj_count=50, batch_size=1):
         all_scores_i = np.load(f)
 
     # calculated_nouns = []
-    calculated_nouns = list(set(all_nouns[:3500]))
-    # did we miss those between 2350 and 2380??
+    calculated_nouns = list(set(all_nouns[:7500]))
+
 
 
     with torch.no_grad():
@@ -318,6 +318,126 @@ def causal_lm():
     # list(logits.shape) == expected_shape
 
 
+def make_imdb_texts():
+    from datasets import load_dataset
+    imdb = load_dataset("imdb")
+
+    for _pos in ["all", "pos", "neg"]:
+        train_path = f'/cs/snapless/oabend/eitan.wagner/segmentation/data/imdb/train_text_{_pos}'
+        test_path = f'/cs/snapless/oabend/eitan.wagner/segmentation/data/imdb/val_text_{_pos}'
+
+        if _pos == "all":
+            train_lines = [_t['text'] for _t in imdb['train']]
+            test_lines = [_t['text'] for _t in imdb['test']]
+        elif _pos == "pos":
+            train_lines = [_t['text'] for _t in imdb['train'] if _t['label'] == 1]
+            test_lines = [_t['text'] for _t in imdb['test'] if _t['label'] == 1]
+        else:
+            train_lines = [_t['text'] for _t in imdb['train'] if _t['label'] == 0]
+            test_lines = [_t['text'] for _t in imdb['test'] if _t['label'] == 0]
+
+        with open(train_path, 'w') as f:
+            f.write('\n\n'.join(train_lines))
+        with open(test_path, 'w') as f:
+            f.write('\n\n'.join(test_lines))
+
+
+def train_gpt2_imdb(pos='all', classification=False):
+    from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel, GPT2ForSequenceClassification
+
+    tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir='/cs/snapless/oabend/eitan.wagner/cache/')
+    tokenizer.pad_token = tokenizer.eos_token
+
+    if not classification:
+        configuration = GPT2Config()
+        model = GPT2LMHeadModel(config=configuration)
+
+        train_path = f'/cs/snapless/oabend/eitan.wagner/segmentation/data/imdb/train_text_{pos}'
+        test_path = f'/cs/snapless/oabend/eitan.wagner/segmentation/data/imdb/val_text_{pos}'
+
+        from transformers import TextDataset, DataCollatorForLanguageModeling
+
+        def load_dataset(train_path,test_path,tokenizer):
+            train_dataset = TextDataset(
+                tokenizer=tokenizer,
+                file_path=train_path,
+                block_size=128)
+
+            test_dataset = TextDataset(
+                tokenizer=tokenizer,
+                file_path=test_path,
+                block_size=128)
+
+            data_collator = DataCollatorForLanguageModeling(
+                tokenizer=tokenizer, mlm=False,
+            )
+            return train_dataset, test_dataset, data_collator
+
+        train_dataset, test_dataset, data_collator = load_dataset(train_path,test_path,tokenizer)
+
+    if classification:
+        from datasets import load_dataset, load_metric
+        metric = load_metric("accuracy")
+        def compute_metrics(eval_pred):
+            logits, labels = eval_pred
+            predictions = np.argmax(logits, axis=-1)
+            return metric.compute(predictions=predictions, references=labels)
+
+        configuration = GPT2Config()
+        configuration.num_labels = 2
+        configuration.problem_type = "single_label_classification"
+        model = GPT2ForSequenceClassification(config=configuration)
+        model.config.pad_token_id = model.config.eos_token_id
+
+        imdb = load_dataset("imdb")
+        from transformers import TextDataset
+
+        def preprocess_function(examples):
+            return tokenizer(examples["text"], truncation=True, padding="max_length")
+
+        tokenized_imdb = imdb.map(preprocess_function, batched=True)
+
+        train_dataset, test_dataset = tokenized_imdb["train"], tokenized_imdb["test"]
+
+    from transformers import Trainer, TrainingArguments
+
+    training_args = TrainingArguments(
+        output_dir=f"/cs/snapless/oabend/eitan.wagner/segmentation/models/imdb/gpt2-{pos}", #The output directory
+        overwrite_output_dir=True, #overwrite the content of the output directory
+        num_train_epochs=5, # number of training epochs
+        gradient_accumulation_steps=1 if not classification else 8,
+        per_device_train_batch_size=16 if not classification else 2,  # batch size for training
+        learning_rate=5e-5,
+        per_device_eval_batch_size=16 if not classification else 2,  # batch size for evaluation
+        eval_steps=400,  # Number of update steps between two evaluations.
+        save_steps=5000,  # after # steps model is saved
+        warmup_steps=500,  # number of warmup steps for learning rate scheduler
+        prediction_loss_only=True,
+        logging_steps=10,
+        evaluation_strategy="epoch",
+    )
+
+    if not classification:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=test_dataset,
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=test_dataset,
+            compute_metrics=compute_metrics,
+        )
+
+    trainer.train()
+
+    trainer.save_model()
+
 def main():
     # mask_filling()
     # causal_lm()
@@ -341,6 +461,24 @@ def main():
     # T5_mask_filling(w1="encyclopedia", w2="exclusive")
     print("Done")
 
+def main2(classification=False):
+    # make_imdb_texts()
+    if classification:
+        print("Training classifier")
+        train_gpt2_imdb(classification=True)
+    else:
+        for _pos in ["all", "pos", "neg"]:
+            print(f"Training LM-{_pos}")
+            train_gpt2_imdb(pos=_pos)
+
 
 if __name__ == "__main__":
-    main()
+    import sys
+    print(sys.argv)
+    if "gpt2-imdb" in sys.argv:
+        if "classification" in sys.argv:
+            main2(classification=True)
+        else:
+            main2(classification=False)
+    elif "t5" in sys.argv:
+        main()
